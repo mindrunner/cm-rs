@@ -1,0 +1,49 @@
+[package]
+name = "cm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Decentralized Solana snapshot cluster manager"
+license = "Apache-2.0"
+repository = "https://github.com/mindrunner/cm-rs"
+homepage = "https://github.com/mindrunner/cm-rs"
+readme = "README.md"
+keywords = ["solana", "snapshot", "cluster", "validator"]
+categories = ["command-line-utilities", "network-programming"]
+
+[lib]
+name = "cm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+axum = { version = "0.8", features = ["tokio"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+humantime-serde = "1"
+inotify = "0.11"
+parking_lot = "0.12"
+prometheus-client = "0.24"
+reqwest = { version = "0.13", features = ["stream", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

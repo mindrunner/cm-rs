@@ -1,0 +1,24 @@
+[Unit]
+Description=Solana Cluster Manager
+Documentation=https://github.com/mindrunner/cm-rs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sol
+Group=sol
+
+ExecStart=/usr/local/bin/cm daemon --config /etc/cm/config.toml
+ExecStartPre=/usr/local/bin/cm fetch --config /etc/cm/config.toml
+
+Restart=always
+RestartSec=10
+
+SyslogIdentifier=cm
+Environment=RUST_LOG=cm=info
+
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target

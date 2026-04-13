@@ -1,0 +1,127 @@
+# cm configuration example
+#
+# Copy this file to /etc/cm/config.toml and adjust to your environment.
+# Only [node].snapshot_dir is required; everything else has sensible defaults.
+
+# ---------------------------------------------------------------------------
+# Node — local snapshot directory and server addresses
+# ---------------------------------------------------------------------------
+[node]
+
+# Path to the directory containing .tar.zst snapshot files (REQUIRED).
+snapshot_dir = "/mnt/snapshots"
+
+# Bind address for the HTTP API server.
+# Default: "0.0.0.0:13080"
+# listen_addr = "0.0.0.0:13080"
+
+# Bind address for the Prometheus metrics endpoint.
+# Default: "0.0.0.0:9184"
+# metrics_addr = "0.0.0.0:9184"
+
+# Optional cluster name added as a label to all Prometheus metrics.
+# cluster_name = "mainnet-rpc"
+
+# ---------------------------------------------------------------------------
+# Peers — how to discover other cm nodes
+# ---------------------------------------------------------------------------
+[peers]
+
+# How often to poll peers for their snapshot inventory.
+# Accepts human-readable durations: "15s", "1m", etc.
+# Default: "15s"
+# poll_interval = "15s"
+
+# Static peer list. Each entry is "host:port".
+[peers.static]
+hosts = [
+    "peer1.example.com:13080",
+    "peer2.example.com:13080",
+]
+
+# Tailscale-based peer discovery (optional).
+# [peers.tailscale]
+# enabled = true
+# tag = "tag:solana-rpc"
+# port = 13080
+
+# ---------------------------------------------------------------------------
+# Download — snapshot download behaviour
+# ---------------------------------------------------------------------------
+[download]
+
+# Download backend: "builtin" (parallel HTTP chunks) or "aria2c".
+# Default: "builtin"
+# backend = "builtin"
+
+# Number of parallel download chunks (builtin backend).
+# Default: 16
+# parallel_chunks = 16
+
+# Only download if the best remote snapshot is at least this many slots ahead.
+# Default: 2500
+# min_slots_behind = 2500
+
+# Maximum number of full snapshots to keep locally.
+# Default: 2
+# max_full_snapshots = 2
+
+# Maximum number of incremental snapshots to keep locally.
+# Default: 4
+# max_incremental_snapshots = 4
+
+# Prefer peers whose datacenter label matches one of these values.
+# dc_affinity = ["ams", "fra"]
+
+# Minimum download speed in bytes/sec. If speed stays below this threshold
+# for 60 continuous seconds the download is aborted. 0 = disabled.
+# Default: 0
+# min_speed = 50000000
+
+# aria2c backend settings (only used when backend = "aria2c").
+# [download.aria2c]
+# binary = "/usr/bin/aria2c"
+# extra_args = ["--max-concurrent-downloads=5"]
+
+# ---------------------------------------------------------------------------
+# S3 — optional snapshot upload to S3-compatible storage
+# ---------------------------------------------------------------------------
+[s3]
+
+# Enable periodic S3 uploads.
+# Default: false
+enabled = false
+
+# S3 bucket name.
+# bucket = "my-snapshots"
+
+# AWS region (or leave unset for default credential chain).
+# region = "us-east-1"
+
+# Custom S3 endpoint for non-AWS providers (MinIO, Cloudflare R2, etc.).
+# endpoint = "https://s3.custom.com"
+
+# Key prefix for uploaded objects.
+# prefix = "snapshots/"
+
+# Use path-style bucket addressing (required by some S3-compatible stores).
+# Default: false
+# path_style = false
+
+# How often to check for new snapshots to upload.
+# Default: "5m"
+# upload_interval = "5m"
+
+# ---------------------------------------------------------------------------
+# Auto — periodic automatic snapshot fetching
+# ---------------------------------------------------------------------------
+[auto]
+
+# Enable the auto-fetch loop inside the daemon.
+# When disabled the daemon runs in serve-only mode.
+# Default: true
+enabled = true
+
+# How often to check whether a newer snapshot should be fetched.
+# Default: "30s"
+# check_interval = "30s"
