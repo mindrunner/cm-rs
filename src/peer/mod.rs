@@ -58,21 +58,19 @@ impl PeerInfo {
 #[derive(Clone)]
 pub struct PeerManager {
     config: PeersConfig,
-    dc_affinity: Vec<String>,
     peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
     client: reqwest::Client,
     metrics: Metrics,
 }
 
 impl PeerManager {
-    pub fn new(config: PeersConfig, dc_affinity: Vec<String>, metrics: Metrics) -> Self {
+    pub fn new(config: PeersConfig, metrics: Metrics) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
             .expect("build http client");
         Self {
             config,
-            dc_affinity,
             peers: Arc::new(RwLock::new(HashMap::new())),
             client,
             metrics,
@@ -182,7 +180,7 @@ impl PeerManager {
         let peers = self.peers.read().await;
         let mut list: Vec<PeerInfo> = peers.values().cloned().collect();
 
-        let affinity = &self.dc_affinity;
+        let affinity = &self.config.dc_affinity;
         for peer in &mut list {
             peer.stats.score = compute_score(&peer.addr, &peer.stats, affinity);
         }

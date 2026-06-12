@@ -1,7 +1,7 @@
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::download::DownloadOrchestrator;
+use crate::download::{DownloadOrchestrator, agave_bootstrap_slot};
 use crate::index::SnapshotIndex;
 use crate::metrics::{Metrics, TypeLabel};
 use crate::peer::PeerManager;
@@ -15,13 +15,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let metrics = Metrics::new(config.node.cluster_name.as_deref());
     let index = SnapshotIndex::new(config.node.snapshot_dir.clone());
     index.scan().await?;
+    clean_staging(&index).await;
     update_local_metrics(&index, &metrics).await;
 
-    let peer_mgr = PeerManager::new(
-        config.peers.clone(),
-        config.download.dc_affinity.clone(),
-        metrics.clone(),
-    );
+    let peer_mgr = PeerManager::new(config.peers.clone(), metrics.clone());
 
     let orchestrator = DownloadOrchestrator::new(
         config.download.clone(),
@@ -54,13 +51,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let index_watcher = index.clone();
     let metrics_watcher = metrics.clone();
     tokio::spawn(async move {
-        loop {
-            if let Err(e) = index_watcher.watch_loop().await {
-                warn!(error = %e, "inotify watcher restarting");
-            }
-            update_local_metrics(&index_watcher, &metrics_watcher).await;
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
+        run_index_watcher(index_watcher, metrics_watcher).await;
     });
 
     let peer_mgr_poll = peer_mgr.clone();
@@ -101,19 +92,69 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_index_watcher(index: SnapshotIndex, metrics: Metrics) {
+    loop {
+        if let Err(e) = run_index_watch_loop(index.clone(), metrics.clone()).await {
+            warn!(error = %e, "inotify watcher restarting");
+        }
+        update_local_metrics(&index, &metrics).await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+async fn run_index_watch_loop(index: SnapshotIndex, metrics: Metrics) -> anyhow::Result<()> {
+    let callback_index = index.clone();
+    let callback_metrics = metrics.clone();
+    index
+        .watch_loop_with_rescan(move || {
+            let callback_index = callback_index.clone();
+            let callback_metrics = callback_metrics.clone();
+            async move {
+                update_local_metrics(&callback_index, &callback_metrics).await;
+            }
+        })
+        .await
+}
+
+#[cfg(test)]
+async fn run_index_watcher_once(index: SnapshotIndex, metrics: Metrics) -> anyhow::Result<()> {
+    let callback_index = index.clone();
+    let callback_metrics = metrics.clone();
+    index
+        .watch_once_with_rescan(move || {
+            let callback_index = callback_index.clone();
+            let callback_metrics = callback_metrics.clone();
+            async move {
+                update_local_metrics(&callback_index, &callback_metrics).await;
+            }
+        })
+        .await
+}
+
+/// Sweep stale entries from the staging directory; never fatal.
+async fn clean_staging(index: &SnapshotIndex) {
+    let bootstrap = agave_bootstrap_slot(&index.list().await);
+    if let Err(e) = index.clean_staging(bootstrap).await {
+        warn!(error = %e, "failed to clean staging directory");
+    }
+}
+
 /// One-shot fetch: discover peers, poll them once, find best snapshot, download, exit.
-pub async fn fetch_once(config: Config) -> anyhow::Result<()> {
+/// With `force`, the freshness gate is bypassed (`min_slots_behind` treated as 0).
+pub async fn fetch_once(mut config: Config, force: bool) -> anyhow::Result<()> {
     info!("one-shot snapshot fetch");
+
+    if force {
+        info!("--force: bypassing min_slots_behind gate");
+        config.download.min_slots_behind = 0;
+    }
 
     let metrics = Metrics::new(config.node.cluster_name.as_deref());
     let index = SnapshotIndex::new(config.node.snapshot_dir.clone());
     index.scan().await?;
+    clean_staging(&index).await;
 
-    let peer_mgr = PeerManager::new(
-        config.peers.clone(),
-        config.download.dc_affinity.clone(),
-        metrics.clone(),
-    );
+    let peer_mgr = PeerManager::new(config.peers.clone(), metrics.clone());
 
     // Run one poll cycle with a timeout to populate the peer list
     info!("discovering and polling peers...");
@@ -127,12 +168,12 @@ pub async fn fetch_once(config: Config) -> anyhow::Result<()> {
     let peer_count = peer_mgr.peer_count().await;
     info!(peer_count, "poll cycle complete");
 
-    let orchestrator = DownloadOrchestrator::new(
-        config.download.clone(),
-        index.clone(),
-        peer_mgr,
-        metrics,
-    );
+    if peer_count == 0 {
+        anyhow::bail!("no peers discovered, cannot fetch");
+    }
+
+    let orchestrator =
+        DownloadOrchestrator::new(config.download.clone(), index.clone(), peer_mgr, metrics);
 
     match orchestrator.fetch_if_needed().await {
         Ok(true) => info!("fetch complete: downloaded new snapshot"),
@@ -243,5 +284,43 @@ async fn update_local_metrics(index: &SnapshotIndex, metrics: &Metrics) {
             .local_snapshot_slot
             .get_or_create(&TypeLabel::new("incremental"))
             .set(slot as i64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_refreshes_local_metrics_after_external_snapshot_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = SnapshotIndex::new(dir.path().to_path_buf());
+        let metrics = Metrics::new(None);
+
+        index.scan().await.unwrap();
+        update_local_metrics(&index, &metrics).await;
+
+        let watcher = tokio::spawn(run_index_watcher_once(index.clone(), metrics.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        std::fs::write(dir.path().join("snapshot-100-hash.tar.zst"), b"snapshot").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let encoded = metrics.encode();
+            if encoded.contains("cm_local_snapshot_slot{type=\"full\"} 100") {
+                break;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "watcher did not refresh full snapshot metric after external snapshot creation; metrics:\n{encoded}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        watcher.await.unwrap().unwrap();
     }
 }

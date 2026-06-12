@@ -9,13 +9,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
-const MIN_SPEED_WINDOW: Duration = Duration::from_secs(60);
+use super::DownloadResult;
 
-/// Result of a download: bytes written and SHA-256 hex digest.
-pub struct DownloadResult {
-    pub bytes: u64,
-    pub sha256: String,
-}
+const MIN_SPEED_WINDOW: Duration = Duration::from_secs(60);
 
 /// Download a file using parallel HTTP range requests.
 ///

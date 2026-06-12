@@ -27,6 +27,19 @@ impl TypeLabel {
     }
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ReasonLabel {
+    pub reason: String,
+}
+
+impl ReasonLabel {
+    pub fn new(reason: &str) -> Self {
+        Self {
+            reason: reason.to_string(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Metrics {
     pub registry: Arc<RwLock<Registry>>,
@@ -39,6 +52,7 @@ pub struct Metrics {
     pub peers_total: Gauge,
     pub download_duration: Histogram,
     pub download_bytes: Counter,
+    pub downloads_by_reason: Family<ReasonLabel, Counter>,
     pub s3_upload_duration: Histogram,
 }
 
@@ -115,6 +129,13 @@ impl Metrics {
             download_bytes.clone(),
         );
 
+        let downloads_by_reason = Family::<ReasonLabel, Counter>::default();
+        reg.register(
+            "cm_downloads",
+            "Completed downloads by reason (bootstrap, behind, topup)",
+            downloads_by_reason.clone(),
+        );
+
         let s3_upload_duration = Histogram::new(exponential_buckets(1.0, 2.0, 15));
         reg.register(
             "cm_s3_upload_duration_seconds",
@@ -132,6 +153,7 @@ impl Metrics {
             peers_total,
             download_duration,
             download_bytes,
+            downloads_by_reason,
             s3_upload_duration,
         }
     }

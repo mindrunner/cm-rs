@@ -91,7 +91,7 @@ cm <COMMAND>
 | Command   | Description                                                | Key Flags                                    |
 |-----------|------------------------------------------------------------|----------------------------------------------|
 | `daemon`  | Run the full service (indexer, peers, API, metrics, fetch) | `-c, --config <PATH>` (default `/etc/cm/config.toml`) |
-| `fetch`   | One-shot: discover peers, download best snapshot, exit     | `-c, --config <PATH>`                        |
+| `fetch`   | One-shot: discover peers, download best snapshot, exit     | `-c, --config <PATH>`, `--force` (bypass `min_slots_behind` gate) |
 | `status`  | Query a running daemon and print snapshot/peer info        | `-u, --url <URL>` (default `http://localhost:13080`)   |
 | `peers`   | List known peers with latency/bandwidth stats              | `-u, --url <URL>`                            |
 | `upload`  | One-shot: upload best snapshot to S3                       | `-c, --config <PATH>`                        |
@@ -114,9 +114,10 @@ for a fully commented example.
 
 ### `[peers]`
 
-| Key             | Type     | Default | Description                    |
-|-----------------|----------|---------|--------------------------------|
-| `poll_interval` | duration | `15s`   | How often to poll peers        |
+| Key             | Type     | Default | Description                       |
+|-----------------|----------|---------|-----------------------------------|
+| `poll_interval` | duration | `15s`   | How often to poll peers           |
+| `dc_affinity`   | string[] | `[]`    | Prefer peers in these datacenters |
 
 ### `[peers.static]`
 
@@ -138,10 +139,9 @@ for a fully commented example.
 |--------------------------|----------|-----------|------------------------------------------------|
 | `backend`                | string   | `builtin` | Download backend: `builtin` or `aria2c`        |
 | `parallel_chunks`        | u16      | `16`      | Number of parallel download chunks             |
-| `min_slots_behind`       | u64      | `2500`    | Minimum slot gap to trigger a download         |
+| `min_slots_behind`       | u64      | `2500`    | Gate for **full** downloads: fetch a full only when the local bootstrap slot is at least this far behind the best peer (or on bootstrap), and only when it improves the bootstrap by at least this much. Incremental top-ups on the local full are not gated. |
 | `max_full_snapshots`     | u32      | `2`       | Max full snapshots to retain                   |
 | `max_incremental_snapshots` | u32   | `4`       | Max incremental snapshots to retain            |
-| `dc_affinity`            | string[] | `[]`      | Prefer peers in these datacenters              |
 | `min_speed`              | u64      | `0`       | Min bytes/sec; abort after 60s below (0 = off) |
 
 ### `[download.aria2c]`
@@ -236,6 +236,13 @@ label is added to every metric.
 | `cm_download_duration_seconds`    | histogram | Snapshot download duration     |
 | `cm_download_bytes_total`         | counter   | Total bytes downloaded         |
 | `cm_s3_upload_duration_seconds`   | histogram | S3 upload duration             |
+
+## Acknowledgments
+
+`cm` was inspired by [Blockdaemon's solana-cluster](https://github.com/Blockdaemon/solana-cluster),
+a Go-based tool for managing Solana snapshots across private clusters. If you're
+looking for an alternative with a different architecture (centralized tracker +
+sidecar model), check it out.
 
 ## Contributing
 

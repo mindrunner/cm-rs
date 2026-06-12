@@ -1,27 +1,32 @@
 pub mod aria2c;
 pub mod builtin;
+pub mod policy;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tracing::{info, warn};
 
 use crate::config::DownloadConfig;
 use crate::index::SnapshotIndex;
 use crate::metrics::Metrics;
 use crate::peer::PeerManager;
-use crate::snapshot::{SnapshotInfo, SnapshotType};
+use crate::snapshot::{self, SnapshotInfo};
 
-/// A downloadable snapshot set: the full snapshot and an optional incremental.
-#[derive(Debug, Clone)]
-pub struct DownloadPlan {
-    pub peer_addr: String,
-    pub full: SnapshotInfo,
-    pub incremental: Option<SnapshotInfo>,
+pub use policy::{
+    DownloadPlan, FetchDecision, FetchReason, FullFetchGate, agave_bootstrap_slot,
+    build_download_plan, decide, plan_resulting_bootstrap, rank_incremental_plans,
+    rank_newer_full_plans,
+};
+
+/// Result of a backend download: bytes written and SHA-256 hex digest.
+pub struct DownloadResult {
+    pub bytes: u64,
+    pub sha256: String,
 }
 
-/// A successfully downloaded file in the tmp directory.
+/// A successfully downloaded file in the staging directory.
 struct DownloadedFile {
     file_name: String,
     sha256: String,
@@ -39,22 +44,38 @@ async fn download_one_file(
     let url = format!("http://{}/api/v1/snapshot/{}", peer_addr, file.file_name);
     let dest = tmp_dir.join(&file.file_name);
 
+    // Reuse a previously staged file whose contents already match the
+    // peer-reported hash (e.g. a verified full kept after a staleness bail) —
+    // hashing is minutes, re-downloading is hours.
+    if let Some(ref expected) = file.sha256 {
+        if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+            let path = dest.clone();
+            if let Ok(Ok(hash)) =
+                tokio::task::spawn_blocking(move || crate::snapshot::sha256_file(&path)).await
+            {
+                if hash == *expected {
+                    let bytes = tokio::fs::metadata(&dest).await?.len();
+                    info!(
+                        file = file.file_name,
+                        "reusing staged file with matching checksum"
+                    );
+                    return Ok(DownloadedFile {
+                        file_name: file.file_name.clone(),
+                        sha256: hash,
+                        bytes,
+                    });
+                }
+            }
+        }
+    }
+
     let result = match config.backend {
         crate::config::DownloadBackend::Builtin => {
             builtin::download(&url, &dest, config.parallel_chunks, config.min_speed).await?
         }
         crate::config::DownloadBackend::Aria2c => {
-            let bytes =
-                aria2c::download(&config.aria2c, &url, tmp_dir, &file.file_name, config.min_speed)
-                    .await?;
-            let path = dest.clone();
-            let hash =
-                tokio::task::spawn_blocking(move || crate::snapshot::sha256_file(&path))
-                    .await??;
-            builtin::DownloadResult {
-                bytes,
-                sha256: hash,
-            }
+            aria2c::download(&config.aria2c, &url, tmp_dir, &file.file_name, config.min_speed)
+                .await?
         }
     };
 
@@ -80,22 +101,6 @@ async fn download_one_file(
         sha256: result.sha256,
         bytes: result.bytes,
     })
-}
-
-/// Move a downloaded file from `tmp_dir` to `snap_dir` and write a `.sha256`
-/// sidecar file next to it.
-async fn finalize_file(dl: &DownloadedFile, tmp_dir: &Path, snap_dir: &Path) -> Result<()> {
-    let src = tmp_dir.join(&dl.file_name);
-    let dst = snap_dir.join(&dl.file_name);
-    tokio::fs::rename(&src, &dst)
-        .await
-        .with_context(|| format!("rename {} -> {}", src.display(), dst.display()))?;
-    let mut sidecar = dst.as_os_str().to_owned();
-    sidecar.push(".sha256");
-    tokio::fs::write(PathBuf::from(sidecar), format!("{}\n", dl.sha256))
-        .await
-        .ok();
-    Ok(())
 }
 
 /// Orchestrates finding the best snapshot and downloading it.
@@ -124,93 +129,163 @@ impl DownloadOrchestrator {
     /// Check if we need a new snapshot and download it if so.
     /// Returns true if a download was performed.
     pub async fn fetch_if_needed(&self) -> Result<bool> {
-        let local_slot = self.index.highest_slot().await;
-
+        let local_snaps = self.index.list().await;
         let ranked = self.peer_mgr.ranked_peers().await;
         if ranked.is_empty() {
             info!("no peers available, skipping fetch");
             return Ok(false);
         }
 
-        let best_remote_slot = ranked.iter().map(|p| p.highest_slot()).max().unwrap_or(0);
+        let decision = policy::decide(&local_snaps, &ranked, self.config.min_slots_behind);
 
-        if best_remote_slot <= local_slot {
-            info!(local_slot, best_remote_slot, "local is up to date");
+        let Some(reason) = decision.reason else {
+            match decision.gate {
+                FullFetchGate::UpToDate => info!(
+                    local_bootstrap = decision.local_bootstrap,
+                    best_remote_slot = decision.best_remote_slot,
+                    "local bootstrap is up to date with peers"
+                ),
+                FullFetchGate::NotFarEnoughBehind { diff } => info!(
+                    local_bootstrap = decision.local_bootstrap,
+                    best_remote_slot = decision.best_remote_slot,
+                    diff,
+                    min = self.config.min_slots_behind,
+                    "not far enough behind for new full snapshot"
+                ),
+                FullFetchGate::Seek { .. } => info!(
+                    local_bootstrap = decision.local_bootstrap,
+                    best_remote_slot = decision.best_remote_slot,
+                    "behind, but no worthwhile plan from peers; waiting"
+                ),
+            }
             return Ok(false);
-        }
+        };
 
-        let diff = best_remote_slot - local_slot;
-        if diff < self.config.min_slots_behind {
-            info!(
-                local_slot,
-                best_remote_slot,
-                diff,
-                min = self.config.min_slots_behind,
-                "not far enough behind, skipping"
-            );
-            return Ok(false);
+        info!(
+            reason = reason.as_str(),
+            local_bootstrap = decision.local_bootstrap,
+            best_remote_slot = decision.best_remote_slot,
+            plans = decision.plans.len(),
+            "fetch cycle planned"
+        );
+
+        for plan in &decision.plans {
+            if plan.incremental_only {
+                info!(
+                    peer = plan.peer_addr,
+                    base_full = plan.full.slot,
+                    incremental = plan.incremental.as_ref().map(|s| s.slot),
+                    "attempting incremental on local full"
+                );
+            } else {
+                info!(
+                    peer = plan.peer_addr,
+                    full = plan.full.file_name,
+                    incremental = plan.incremental.as_ref().map(|s| &s.file_name),
+                    "attempting newer full snapshot plan"
+                );
+            }
+            match self
+                .execute_plan(plan, decision.best_remote_slot, decision.local_bootstrap, reason)
+                .await
+            {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(e) => {
+                    warn!(peer = plan.peer_addr, error = %e, "download failed, trying next plan");
+                }
+            }
         }
 
         info!(
-            local_slot,
-            best_remote_slot,
-            diff,
-            "snapshot is stale, fetching"
+            reason = reason.as_str(),
+            "no download plan succeeded this cycle"
         );
+        Ok(false)
+    }
 
-        for peer in &ranked {
-            if peer.highest_slot() < best_remote_slot {
-                continue;
+    async fn plan_needs_download(&self, plan: &DownloadPlan) -> bool {
+        let dir = self.index.dir();
+        if plan.incremental_only {
+            if let Some(inc) = &plan.incremental {
+                return !snapshot::file_complete(dir, &inc.file_name).await;
             }
-            let plan = match build_download_plan(peer, best_remote_slot) {
-                Some(p) => p,
-                None => continue,
-            };
-            info!(
-                peer = peer.addr,
-                full = plan.full.file_name,
-                incremental = plan.incremental.as_ref().map(|s| &s.file_name),
-                "attempting download"
-            );
+            return false;
+        }
+        let need_full = !snapshot::file_complete(dir, &plan.full.file_name).await;
+        let need_inc = match &plan.incremental {
+            Some(inc) => !snapshot::file_complete(dir, &inc.file_name).await,
+            None => false,
+        };
+        need_full || need_inc
+    }
 
-            let start = Instant::now();
-            match self.download_plan(&plan, best_remote_slot).await {
-                Ok(bytes) => {
-                    let duration = start.elapsed();
-                    let bps = bytes as f64 / duration.as_secs_f64();
-                    self.peer_mgr.record_bandwidth(&peer.addr, bps).await;
-                    self.metrics
-                        .download_duration
-                        .observe(duration.as_secs_f64());
-                    self.metrics.download_bytes.inc_by(bytes);
-                    info!(
-                        peer = peer.addr,
-                        bytes,
-                        duration_secs = duration.as_secs_f64(),
-                        mbps = bps / 1_000_000.0,
-                        "download complete"
-                    );
-                    self.index.scan().await?;
-                    self.cleanup().await?;
-                    return Ok(true);
-                }
-                Err(e) => {
-                    warn!(peer = peer.addr, error = %e, "download failed, trying next peer");
-                    continue;
-                }
-            }
+    async fn execute_plan(
+        &self,
+        plan: &DownloadPlan,
+        best_remote_slot: u64,
+        local_bootstrap: u64,
+        reason: FetchReason,
+    ) -> Result<bool> {
+        if !self.plan_needs_download(plan).await {
+            info!("snapshot plan already satisfied locally");
+            return Ok(false);
         }
 
-        anyhow::bail!("all peers failed");
+        let start = Instant::now();
+        match self
+            .download_plan(plan, best_remote_slot, local_bootstrap)
+            .await
+        {
+            Ok(bytes) if bytes > 0 => {
+                let duration = start.elapsed();
+                let bps = bytes as f64 / duration.as_secs_f64();
+                self.peer_mgr.record_bandwidth(&plan.peer_addr, bps).await;
+                self.metrics
+                    .download_duration
+                    .observe(duration.as_secs_f64());
+                self.metrics.download_bytes.inc_by(bytes);
+                self.metrics
+                    .downloads_by_reason
+                    .get_or_create(&crate::metrics::ReasonLabel::new(reason.as_str()))
+                    .inc();
+                info!(
+                    peer = plan.peer_addr,
+                    bytes,
+                    duration_secs = duration.as_secs_f64(),
+                    mbps = bps / 1_000_000.0,
+                    "download complete"
+                );
+                self.index
+                    .retain(
+                        self.config.max_full_snapshots,
+                        self.config.max_incremental_snapshots,
+                    )
+                    .await?;
+                Ok(true)
+            }
+            Ok(_) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     async fn download_plan(
         &self,
         plan: &DownloadPlan,
         best_remote_slot: u64,
+        local_bootstrap: u64,
     ) -> Result<u64> {
         let snap_dir = self.index.dir();
-        let tmp_dir = snap_dir.join(".cm-tmp");
+        if plan.incremental_only
+            && !snapshot::file_complete(snap_dir, &plan.full.file_name).await
+        {
+            anyhow::bail!(
+                "incremental-only plan requires base full on disk: {}",
+                plan.full.file_name
+            );
+        }
+
+        let tmp_dir = self.index.staging_dir();
         tokio::fs::create_dir_all(&tmp_dir).await?;
 
         let full_local = self.exists_locally(&plan.full).await;
@@ -229,7 +304,7 @@ impl DownloadOrchestrator {
             );
         }
 
-        let need_full = !full_local;
+        let need_full = !plan.incremental_only && !full_local;
         let need_inc = plan.incremental.is_some() && !inc_local;
 
         let (full_dl, inc_dl) = match (need_full, need_inc) {
@@ -282,7 +357,7 @@ impl DownloadOrchestrator {
         let inc_dl = match inc_dl {
             Some(dl) => Some(dl),
             None if plan.incremental.is_some() && !inc_local => {
-                self.try_fetch_incremental(plan.full.slot, &tmp_dir, &plan.peer_addr)
+                self.try_fetch_incremental(plan.full.slot, local_bootstrap, &tmp_dir, &plan.peer_addr)
                     .await
             }
             None => None,
@@ -290,16 +365,16 @@ impl DownloadOrchestrator {
 
         let got_incremental = inc_dl.is_some() || inc_local;
 
-        // Staleness gate: if no incremental, check whether the full alone is fresh enough
-        if !got_incremental {
-            let staleness = best_remote_slot.saturating_sub(plan.full.slot);
-            if staleness > self.config.min_slots_behind {
-                if !full_local {
-                    tokio::fs::remove_file(tmp_dir.join(&plan.full.file_name))
-                        .await
-                        .ok();
-                }
-                let _ = tokio::fs::remove_dir(&tmp_dir).await;
+        // Staleness gate: full-only downloads must be fresh enough relative to cluster tip.
+        if !got_incremental && !plan.incremental_only {
+            if let Some(staleness) = policy::full_only_too_stale(
+                plan.full.slot,
+                best_remote_slot,
+                self.config.min_slots_behind,
+            ) {
+                // Keep the verified full in staging: next cycle reuses it via
+                // the checksum match in download_one_file instead of pulling
+                // the same 100 GB again.
                 anyhow::bail!(
                     "full snapshot at slot {} is {} slots behind tip {}, \
                      exceeds min_slots_behind={}, need incremental",
@@ -311,44 +386,39 @@ impl DownloadOrchestrator {
             }
             warn!(
                 full_slot = plan.full.slot,
-                staleness,
+                staleness = best_remote_slot.saturating_sub(plan.full.slot),
                 "accepting full-only snapshot (within min_slots_behind)"
             );
         }
 
-        // Move downloaded files to snapshot dir
+        // Admit downloaded files into the snapshot store
         let mut total_bytes = 0u64;
         if let Some(ref dl) = full_dl {
             total_bytes += dl.bytes;
-            finalize_file(dl, &tmp_dir, snap_dir).await?;
+            self.index.admit(&dl.file_name, &dl.sha256).await?;
         }
         if let Some(ref dl) = inc_dl {
             total_bytes += dl.bytes;
-            finalize_file(dl, &tmp_dir, snap_dir).await?;
+            self.index.admit(&dl.file_name, &dl.sha256).await?;
         }
 
         let _ = tokio::fs::remove_dir(&tmp_dir).await;
         Ok(total_bytes)
     }
 
-    /// Check whether a snapshot already exists locally with a matching hash.
+    /// Check whether a completed snapshot file already exists on disk.
     async fn exists_locally(&self, remote: &SnapshotInfo) -> bool {
-        let local = match self.index.get(&remote.file_name).await {
-            Some(s) => s,
-            None => return false,
-        };
-        match (&local.sha256, &remote.sha256) {
-            (Some(local_hash), Some(remote_hash)) => local_hash == remote_hash,
-            (Some(_), None) => true,
-            _ => false,
-        }
+        snapshot::file_complete(self.index.dir(), &remote.file_name).await
     }
 
     /// Re-poll peers live to find and download an incremental snapshot
-    /// compatible with `full_slot`. Tries the original peer first, then others.
+    /// compatible with `full_slot` and strictly above `min_slot` (pass the
+    /// local bootstrap so we never fetch one we already surpass). Tries the
+    /// original peer first, then others.
     async fn try_fetch_incremental(
         &self,
         full_slot: u64,
+        min_slot: u64,
         tmp_dir: &Path,
         original_peer: &str,
     ) -> Option<DownloadedFile> {
@@ -370,15 +440,7 @@ impl DownloadOrchestrator {
                 }
             };
 
-            let best_inc = snapshots
-                .iter()
-                .filter(|s| {
-                    s.snapshot_type == SnapshotType::Incremental
-                        && s.base_slot == Some(full_slot)
-                })
-                .max_by_key(|s| s.slot);
-
-            let inc = match best_inc {
+            let inc = match policy::best_incremental_for(&snapshots, full_slot, min_slot) {
                 Some(s) => s.clone(),
                 None => continue,
             };
@@ -401,145 +463,11 @@ impl DownloadOrchestrator {
         warn!(full_slot, "no peer could serve an incremental snapshot");
         None
     }
-
-    async fn cleanup(&self) -> Result<()> {
-        let snap_dir = self.index.dir();
-        cleanup_old_snapshots(
-            snap_dir,
-            self.config.max_full_snapshots,
-            self.config.max_incremental_snapshots,
-        )
-        .await
-    }
-}
-
-pub fn build_download_plan(peer: &crate::peer::PeerInfo, _target_slot: u64) -> Option<DownloadPlan> {
-    // Find the best full snapshot at or near the target
-    let full = peer
-        .snapshots
-        .iter()
-        .filter(|s| s.snapshot_type == SnapshotType::Full)
-        .max_by_key(|s| s.slot)?;
-
-    // Find the best incremental for this full snapshot's base
-    let incremental = peer
-        .snapshots
-        .iter()
-        .filter(|s| s.snapshot_type == SnapshotType::Incremental && s.base_slot == Some(full.slot))
-        .max_by_key(|s| s.slot);
-
-    Some(DownloadPlan {
-        peer_addr: peer.addr.clone(),
-        full: full.clone(),
-        incremental: incremental.cloned(),
-    })
-}
-
-pub async fn cleanup_old_snapshots(
-    dir: &Path,
-    max_full: u32,
-    max_incremental: u32,
-) -> Result<()> {
-    let mut fulls = list_snapshots_by_type(dir, "snapshot-").await?;
-    let mut incrementals = list_snapshots_by_type(dir, "incremental-snapshot-").await?;
-
-    // Sort newest first by slot extracted from filename
-    fulls.sort_by(|a, b| b.1.cmp(&a.1));
-    incrementals.sort_by(|a, b| b.1.cmp(&a.1));
-
-    let valid_full_slots: std::collections::HashSet<u64> = fulls
-        .iter()
-        .take(max_full as usize)
-        .map(|(_, slot)| *slot)
-        .collect();
-
-    // Remove excess full snapshots
-    for (path, _) in fulls.iter().skip(max_full as usize) {
-        info!(file = %path.display(), "removing old full snapshot");
-        tokio::fs::remove_file(path).await.ok();
-        remove_sidecar(path).await;
-    }
-
-    // Remove orphaned incrementals (base slot not in kept fulls)
-    let mut kept_incrementals = 0u32;
-    for (path, _) in &incrementals {
-        let fname = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        if let Some(base_slot) = parse_incremental_base_slot(fname) {
-            if !valid_full_slots.contains(&base_slot) {
-                info!(file = %path.display(), "removing orphaned incremental snapshot");
-                tokio::fs::remove_file(path).await.ok();
-                remove_sidecar(path).await;
-                continue;
-            }
-        }
-        kept_incrementals += 1;
-        if kept_incrementals > max_incremental {
-            info!(file = %path.display(), "removing old incremental snapshot");
-            tokio::fs::remove_file(path).await.ok();
-            remove_sidecar(path).await;
-        }
-    }
-
-    Ok(())
-}
-
-async fn list_snapshots_by_type(dir: &Path, prefix: &str) -> Result<Vec<(PathBuf, u64)>> {
-    let mut result = Vec::new();
-    let mut entries = tokio::fs::read_dir(dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let name = entry.file_name();
-        let name_str = match name.to_str() {
-            Some(n) => n,
-            None => continue,
-        };
-        if !name_str.starts_with(prefix) || !name_str.ends_with(".tar.zst") {
-            continue;
-        }
-        // Skip .aria2 companions
-        if entry.path().with_extension("zst.aria2").exists() {
-            continue;
-        }
-        let slot = extract_primary_slot(name_str).unwrap_or(0);
-        result.push((entry.path(), slot));
-    }
-    Ok(result)
-}
-
-async fn remove_sidecar(snapshot_path: &Path) {
-    let mut p = snapshot_path.as_os_str().to_owned();
-    p.push(".sha256");
-    tokio::fs::remove_file(PathBuf::from(p)).await.ok();
-}
-
-pub fn extract_primary_slot(name: &str) -> Option<u64> {
-    if let Some(rest) = name.strip_prefix("incremental-snapshot-") {
-        let rest = rest.strip_suffix(".tar.zst")?;
-        let mut parts = rest.splitn(3, '-');
-        let _base: u64 = parts.next()?.parse().ok()?;
-        let slot: u64 = parts.next()?.parse().ok()?;
-        Some(slot)
-    } else if let Some(rest) = name.strip_prefix("snapshot-") {
-        let rest = rest.strip_suffix(".tar.zst")?;
-        let slot: u64 = rest.splitn(2, '-').next()?.parse().ok()?;
-        Some(slot)
-    } else {
-        None
-    }
-}
-
-pub fn parse_incremental_base_slot(name: &str) -> Option<u64> {
-    let rest = name.strip_prefix("incremental-snapshot-")?;
-    let rest = rest.strip_suffix(".tar.zst")?;
-    rest.splitn(3, '-').next()?.parse().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peer::{PeerInfo, PeerStats};
     use crate::snapshot::{SnapshotInfo, SnapshotType};
 
     fn make_snap(slot: u64, full: bool, base: Option<u64>) -> SnapshotInfo {
@@ -566,172 +494,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn extract_primary_slot_full() {
-        assert_eq!(
-            extract_primary_slot("snapshot-12345-hash.tar.zst"),
-            Some(12345)
-        );
-    }
-
-    #[test]
-    fn extract_primary_slot_incremental() {
-        assert_eq!(
-            extract_primary_slot("incremental-snapshot-100-200-hash.tar.zst"),
-            Some(200)
-        );
-    }
-
-    #[test]
-    fn extract_primary_slot_garbage() {
-        assert_eq!(extract_primary_slot("random.tar.zst"), None);
-    }
-
-    #[test]
-    fn parse_base_slot() {
-        assert_eq!(
-            parse_incremental_base_slot("incremental-snapshot-100-200-hash.tar.zst"),
-            Some(100)
-        );
-    }
-
-    #[test]
-    fn parse_base_slot_not_incremental() {
-        assert_eq!(
-            parse_incremental_base_slot("snapshot-100-hash.tar.zst"),
-            None
-        );
-    }
-
-    #[test]
-    fn build_plan_selects_best() {
-        let peer = PeerInfo {
-            addr: "host:1".into(),
-            snapshots: vec![
-                make_snap(100, true, None),
-                make_snap(200, true, None),
-                make_snap(250, false, Some(200)),
-                make_snap(150, false, Some(100)),
-            ],
-            stats: PeerStats::default(),
-        };
-        let plan = build_download_plan(&peer, 250).unwrap();
-        assert_eq!(plan.full.slot, 200);
-        assert_eq!(plan.incremental.as_ref().unwrap().slot, 250);
-    }
-
-    #[test]
-    fn build_plan_no_matching_incremental() {
-        let peer = PeerInfo {
-            addr: "host:1".into(),
-            snapshots: vec![
-                make_snap(100, true, None),
-                make_snap(300, false, Some(999)), // orphan
-            ],
-            stats: PeerStats::default(),
-        };
-        let plan = build_download_plan(&peer, 100).unwrap();
-        assert_eq!(plan.full.slot, 100);
-        assert!(plan.incremental.is_none());
-    }
-
-    #[test]
-    fn build_plan_no_full_snapshot() {
-        let peer = PeerInfo {
-            addr: "host:1".into(),
-            snapshots: vec![make_snap(200, false, Some(100))],
-            stats: PeerStats::default(),
-        };
-        assert!(build_download_plan(&peer, 200).is_none());
-    }
-
-    fn touch(dir: &std::path::Path, name: &str) {
-        std::fs::write(dir.join(name), &[0u8; 64]).unwrap();
-    }
-
-    #[tokio::test]
-    async fn cleanup_removes_excess_full() {
-        let dir = tempfile::tempdir().unwrap();
-        touch(dir.path(), "snapshot-100-a.tar.zst");
-        touch(dir.path(), "snapshot-200-b.tar.zst");
-        touch(dir.path(), "snapshot-300-c.tar.zst");
-
-        cleanup_old_snapshots(dir.path(), 2, 4).await.unwrap();
-
-        assert!(dir.path().join("snapshot-300-c.tar.zst").exists());
-        assert!(dir.path().join("snapshot-200-b.tar.zst").exists());
-        assert!(!dir.path().join("snapshot-100-a.tar.zst").exists());
-    }
-
-    #[tokio::test]
-    async fn cleanup_removes_orphaned_incrementals() {
-        let dir = tempfile::tempdir().unwrap();
-        touch(dir.path(), "snapshot-200-a.tar.zst");
-        touch(
-            dir.path(),
-            "incremental-snapshot-200-250-hash.tar.zst",
-        );
-        // Orphaned: base slot 100 has no full snapshot
-        touch(
-            dir.path(),
-            "incremental-snapshot-100-150-hash.tar.zst",
-        );
-
-        cleanup_old_snapshots(dir.path(), 2, 4).await.unwrap();
-
-        assert!(dir
-            .path()
-            .join("incremental-snapshot-200-250-hash.tar.zst")
-            .exists());
-        assert!(!dir
-            .path()
-            .join("incremental-snapshot-100-150-hash.tar.zst")
-            .exists());
-    }
-
-    #[tokio::test]
-    async fn cleanup_removes_excess_incrementals() {
-        let dir = tempfile::tempdir().unwrap();
-        touch(dir.path(), "snapshot-100-a.tar.zst");
-        touch(
-            dir.path(),
-            "incremental-snapshot-100-200-a.tar.zst",
-        );
-        touch(
-            dir.path(),
-            "incremental-snapshot-100-300-b.tar.zst",
-        );
-        touch(
-            dir.path(),
-            "incremental-snapshot-100-400-c.tar.zst",
-        );
-
-        cleanup_old_snapshots(dir.path(), 2, 2).await.unwrap();
-
-        // Should keep 2 newest incrementals (400, 300) and remove 200
-        assert!(dir
-            .path()
-            .join("incremental-snapshot-100-400-c.tar.zst")
-            .exists());
-        assert!(dir
-            .path()
-            .join("incremental-snapshot-100-300-b.tar.zst")
-            .exists());
-        assert!(!dir
-            .path()
-            .join("incremental-snapshot-100-200-a.tar.zst")
-            .exists());
-    }
-
     fn make_orchestrator(dir: &std::path::Path) -> (DownloadOrchestrator, SnapshotIndex) {
         let index = crate::index::SnapshotIndex::new(dir.to_path_buf());
         let config = crate::config::DownloadConfig::default();
         let metrics = crate::metrics::Metrics::new(None);
-        let peer_mgr = crate::peer::PeerManager::new(
-            crate::config::PeersConfig::default(),
-            Vec::new(),
-            metrics.clone(),
-        );
+        let peer_mgr =
+            crate::peer::PeerManager::new(crate::config::PeersConfig::default(), metrics.clone());
         let orch = DownloadOrchestrator::new(config, index.clone(), peer_mgr, metrics);
         (orch, index)
     }
@@ -768,7 +536,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exists_locally_hash_mismatch() {
+    async fn exists_locally_hash_mismatch_still_skips() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("snapshot-100-hash.tar.zst"), b"data").unwrap();
 
@@ -776,10 +544,12 @@ mod tests {
         index.scan().await.unwrap();
 
         let remote = SnapshotInfo {
-            sha256: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+            sha256: Some(
+                "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            ),
             ..make_snap(100, true, None)
         };
-        assert!(!orch.exists_locally(&remote).await);
+        assert!(orch.exists_locally(&remote).await);
     }
 
     #[tokio::test]

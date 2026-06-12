@@ -12,7 +12,7 @@ async fn start_server(snap_dir: &std::path::Path) -> String {
     let index = SnapshotIndex::new(snap_dir.to_path_buf());
     index.scan().await.unwrap();
     let metrics = Metrics::new(None);
-    let peer_mgr = PeerManager::new(Default::default(), vec![], metrics.clone());
+    let peer_mgr = PeerManager::new(Default::default(), metrics.clone());
     let state = AppState {
         index,
         peer_mgr,

@@ -235,7 +235,7 @@ async fn best_snapshots_compat(
             files.push(snap_to_compat_file(inc));
         }
         let total_size: u64 = files.iter().map(|f| f.size).sum();
-        let hash = extract_hash(&full.file_name);
+        let hash = full.hash_component();
         sources.push(CompatSnapshotSource {
             slot: full.slot,
             hash,
@@ -254,19 +254,10 @@ fn snap_to_compat_file(s: &crate::snapshot::SnapshotInfo) -> CompatSnapshotFile 
         file_name: s.file_name.clone(),
         slot: s.slot,
         base_slot: s.base_slot,
-        hash: extract_hash(&s.file_name),
+        hash: s.hash_component(),
         ext: "tar.zst".into(),
         size: s.size,
     }
-}
-
-fn extract_hash(filename: &str) -> String {
-    let without_ext = filename.strip_suffix(".tar.zst").unwrap_or(filename);
-    without_ext
-        .rsplit('-')
-        .next()
-        .unwrap_or("unknown")
-        .to_string()
 }
 
 fn chrono_or_epoch(ts: u64) -> String {

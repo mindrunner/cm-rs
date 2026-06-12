@@ -32,6 +32,9 @@ snapshot_dir = "/mnt/snapshots"
 # Default: "15s"
 # poll_interval = "15s"
 
+# Prefer peers whose datacenter label matches one of these values.
+# dc_affinity = ["ams", "fra"]
+
 # Static peer list. Each entry is "host:port".
 [peers.static]
 hosts = [
@@ -69,9 +72,6 @@ hosts = [
 # Maximum number of incremental snapshots to keep locally.
 # Default: 4
 # max_incremental_snapshots = 4
-
-# Prefer peers whose datacenter label matches one of these values.
-# dc_affinity = ["ams", "fra"]
 
 # Minimum download speed in bytes/sec. If speed stays below this threshold
 # for 60 continuous seconds the download is aborted. 0 = disabled.

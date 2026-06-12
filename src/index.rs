@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -35,7 +36,7 @@ impl SnapshotIndex {
         let count = entries.len();
         let mut map = self.inner.write().await;
         *map = entries;
-        info!(count, "snapshot index scan complete");
+        debug!(count, "snapshot index scan complete");
         Ok(())
     }
 
@@ -54,10 +55,7 @@ impl SnapshotIndex {
     /// Highest full snapshot slot, if any.
     pub async fn highest_full_slot(&self) -> Option<u64> {
         let map = self.inner.read().await;
-        map.values()
-            .filter(|s| s.is_full())
-            .map(|s| s.slot)
-            .max()
+        map.values().filter(|s| s.is_full()).map(|s| s.slot).max()
     }
 
     /// Highest slot of any type (full or incremental with valid base).
@@ -87,9 +85,126 @@ impl SnapshotIndex {
         &self.dir
     }
 
+    /// Staging directory for in-flight downloads, inside the snapshot dir.
+    /// Files placed here are invisible to the index until [`Self::admit`]ed.
+    pub fn staging_dir(&self) -> PathBuf {
+        self.dir.join(".cm-tmp")
+    }
+
+    /// Move a staged file into the snapshot dir, write its `.sha256` sidecar,
+    /// and add it to the index. The file must already be in [`Self::staging_dir`].
+    pub async fn admit(&self, file_name: &str, sha256: &str) -> anyhow::Result<SnapshotInfo> {
+        let src = self.staging_dir().join(file_name);
+        let dst = self.dir.join(file_name);
+        tokio::fs::rename(&src, &dst)
+            .await
+            .with_context(|| format!("rename {} -> {}", src.display(), dst.display()))?;
+        snapshot::save_sidecar_hash(&dst, sha256);
+
+        let meta = tokio::fs::metadata(&dst).await?;
+        let modified = meta
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut info = SnapshotInfo::from_filename(file_name, meta.len(), modified)
+            .with_context(|| format!("admitted file is not a snapshot: {file_name}"))?;
+        info.sha256 = Some(sha256.to_string());
+        self.inner
+            .write()
+            .await
+            .insert(file_name.to_string(), info.clone());
+        Ok(info)
+    }
+
+    /// Remove staging entries that can no longer improve the local bootstrap:
+    /// snapshot files (and their partial-download markers) at or below
+    /// `keep_min_slot`, plus anything unrecognized (chunk files, junk) and
+    /// orphaned markers. Fresher partials are kept — together with their
+    /// markers — so the download backend can resume them after a restart.
+    pub async fn clean_staging(&self, keep_min_slot: u64) -> anyhow::Result<()> {
+        let staging = self.staging_dir();
+        let mut entries = match tokio::fs::read_dir(&staging).await {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            match entry.file_name().to_str() {
+                Some(n) => names.push(n.to_string()),
+                None => {
+                    tokio::fs::remove_file(entry.path()).await.ok();
+                }
+            }
+        }
+
+        let name_set: std::collections::HashSet<&str> =
+            names.iter().map(|n| n.as_str()).collect();
+        for name in &names {
+            let is_marker = name.ends_with(".aria2");
+            let payload = name.strip_suffix(".aria2").unwrap_or(name);
+            let fresh = snapshot::primary_slot(payload).is_some_and(|s| s > keep_min_slot);
+            let keep = fresh && (!is_marker || name_set.contains(payload));
+            if !keep {
+                debug!(file = name, "removing stale staging entry");
+                tokio::fs::remove_file(staging.join(name)).await.ok();
+            }
+        }
+
+        // Only succeeds when nothing was kept.
+        let _ = tokio::fs::remove_dir(&staging).await;
+        Ok(())
+    }
+
+    /// Retention: keep the newest `max_full` full snapshots and the newest
+    /// `max_incremental` incrementals whose base full survives; delete the
+    /// rest from disk (with their sidecars) and from the index.
+    pub async fn retain(&self, max_full: u32, max_incremental: u32) -> anyhow::Result<()> {
+        let removed = cleanup_old_snapshots(&self.dir, max_full, max_incremental).await?;
+        if !removed.is_empty() {
+            let mut map = self.inner.write().await;
+            for name in &removed {
+                map.remove(name);
+            }
+        }
+        Ok(())
+    }
+
     /// Watch for filesystem changes and update the index.
     pub async fn watch_loop(&self) -> anyhow::Result<()> {
-        let mut ino = Inotify::init().context("inotify init")?;
+        self.watch_loop_with_rescan(|| async {}).await
+    }
+
+    /// Watch until the next snapshot file event, update the index, and run a callback.
+    pub async fn watch_once_with_rescan<F, Fut>(&self, mut on_rescan: F) -> anyhow::Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let mut ino = self.create_watcher()?;
+        self.process_next_snapshot_event(&mut ino, &mut on_rescan)
+            .await
+    }
+
+    /// Watch for filesystem changes, update the index, and run a callback after successful rescans.
+    pub async fn watch_loop_with_rescan<F, Fut>(&self, mut on_rescan: F) -> anyhow::Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let mut ino = self.create_watcher()?;
+
+        loop {
+            self.process_next_snapshot_event(&mut ino, &mut on_rescan)
+                .await?;
+        }
+    }
+
+    fn create_watcher(&self) -> anyhow::Result<Inotify> {
+        let ino = Inotify::init().context("inotify init")?;
         ino.watches()
             .add(
                 &self.dir,
@@ -100,25 +215,37 @@ impl SnapshotIndex {
                     | WatchMask::CLOSE_WRITE,
             )
             .context("inotify watch")?;
+        Ok(ino)
+    }
 
+    async fn process_next_snapshot_event<F, Fut>(
+        &self,
+        ino: &mut Inotify,
+        on_rescan: &mut F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = ()>,
+    {
         let mut buf = vec![0u8; 4096];
-        loop {
-            let events = tokio::task::block_in_place(|| ino.read_events_blocking(&mut buf))?;
-            let mut changed = false;
-            for event in events {
-                if let Some(name) = event.name.and_then(|n| n.to_str()) {
-                    if name.ends_with(".tar.zst") && !name.ends_with(".tar.zst.aria2") {
-                        debug!(file = name, "inotify event");
-                        changed = true;
-                    }
-                }
-            }
-            if changed {
-                if let Err(e) = self.scan().await {
-                    warn!(error = %e, "rescan after inotify event failed");
+        let events = tokio::task::block_in_place(|| ino.read_events_blocking(&mut buf))?;
+        let mut changed = false;
+        for event in events {
+            if let Some(name) = event.name.and_then(|n| n.to_str()) {
+                if snapshot::is_archive_name(name) {
+                    debug!(file = name, "inotify event");
+                    changed = true;
                 }
             }
         }
+        if changed {
+            if let Err(e) = self.scan().await {
+                warn!(error = %e, "rescan after inotify event failed");
+            } else {
+                on_rescan().await;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -147,20 +274,30 @@ fn scan_directory_with_hashes(
     let mut map = HashMap::new();
     let entries = std::fs::read_dir(dir).context("read snapshot dir")?;
     for entry in entries {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
         let name = entry.file_name();
         let name_str = match name.to_str() {
             Some(n) => n,
             None => continue,
         };
-        if !name_str.ends_with(".tar.zst") {
+        if !snapshot::is_archive_name(name_str) {
             continue;
         }
-        let aria2_path = entry.path().with_extension("zst.aria2");
-        if aria2_path.exists() {
+        if snapshot::partial_marker_path(&entry.path()).exists() {
             continue;
         }
-        let meta = entry.metadata()?;
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!(file = name_str, "file vanished during scan");
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         let modified = meta
             .modified()
             .unwrap_or(SystemTime::UNIX_EPOCH)
@@ -177,15 +314,19 @@ fn scan_directory_with_hashes(
             }
             // Try loading from sidecar .sha256 file
             if info.sha256.is_none() {
-                info.sha256 = load_sidecar_hash(&entry.path());
+                info.sha256 = snapshot::load_sidecar_hash(&entry.path());
             }
             // Compute hash if we still don't have one
             if info.sha256.is_none() {
                 match snapshot::sha256_file(&entry.path()) {
                     Ok(hash) => {
                         debug!(file = name_str, hash = hash, "computed sha256");
-                        save_sidecar_hash(&entry.path(), &hash);
+                        snapshot::save_sidecar_hash(&entry.path(), &hash);
                         info.sha256 = Some(hash);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        debug!(file = name_str, "file vanished during hash");
+                        continue;
                     }
                     Err(e) => {
                         warn!(file = name_str, error = %e, "failed to compute sha256");
@@ -199,6 +340,81 @@ fn scan_directory_with_hashes(
     cleanup_orphan_sidecars(dir, &map);
 
     Ok(map)
+}
+
+/// Delete snapshots beyond the retention counts. Returns removed file names.
+async fn cleanup_old_snapshots(
+    dir: &Path,
+    max_full: u32,
+    max_incremental: u32,
+) -> anyhow::Result<Vec<String>> {
+    let mut fulls = list_snapshots_by_type(dir, "snapshot-").await?;
+    let mut incrementals = list_snapshots_by_type(dir, "incremental-snapshot-").await?;
+
+    // Sort newest first by slot extracted from filename
+    fulls.sort_by(|a, b| b.1.cmp(&a.1));
+    incrementals.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let valid_full_slots: std::collections::HashSet<u64> = fulls
+        .iter()
+        .take(max_full as usize)
+        .map(|(_, slot)| *slot)
+        .collect();
+
+    let mut removed = Vec::new();
+    let mut remove = |path: &Path, reason: &str| {
+        info!(file = %path.display(), "removing {reason}");
+        std::fs::remove_file(path).ok();
+        snapshot::remove_sidecar(path);
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            removed.push(name.to_string());
+        }
+    };
+
+    // Remove excess full snapshots
+    for (path, _) in fulls.iter().skip(max_full as usize) {
+        remove(path, "old full snapshot");
+    }
+
+    // Remove orphaned incrementals (base slot not in kept fulls)
+    let mut kept_incrementals = 0u32;
+    for (path, _) in &incrementals {
+        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if let Some(base_slot) = snapshot::incremental_base_slot(fname) {
+            if !valid_full_slots.contains(&base_slot) {
+                remove(path, "orphaned incremental snapshot");
+                continue;
+            }
+        }
+        kept_incrementals += 1;
+        if kept_incrementals > max_incremental {
+            remove(path, "old incremental snapshot");
+        }
+    }
+
+    Ok(removed)
+}
+
+async fn list_snapshots_by_type(dir: &Path, prefix: &str) -> anyhow::Result<Vec<(PathBuf, u64)>> {
+    let mut result = Vec::new();
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(n) => n,
+            None => continue,
+        };
+        if !name_str.starts_with(prefix) || !snapshot::is_archive_name(name_str) {
+            continue;
+        }
+        // Skip incomplete downloads
+        if snapshot::partial_marker_path(&entry.path()).exists() {
+            continue;
+        }
+        let slot = snapshot::primary_slot(name_str).unwrap_or(0);
+        result.push((entry.path(), slot));
+    }
+    Ok(result)
 }
 
 /// Remove `.sha256` sidecar files whose corresponding snapshot no longer exists.
@@ -222,32 +438,6 @@ fn cleanup_orphan_sidecars(dir: &Path, live: &HashMap<String, SnapshotInfo>) {
     }
 }
 
-/// Read a `.sha256` sidecar file. Returns `Some(hex_hash)` if valid.
-fn load_sidecar_hash(snapshot_path: &Path) -> Option<String> {
-    let hash_path = sidecar_path(snapshot_path);
-    let contents = std::fs::read_to_string(&hash_path).ok()?;
-    let hash = contents.trim().to_string();
-    if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(hash)
-    } else {
-        None
-    }
-}
-
-/// Write a `.sha256` sidecar file next to the snapshot.
-fn save_sidecar_hash(snapshot_path: &Path, hash: &str) {
-    let hash_path = sidecar_path(snapshot_path);
-    if let Err(e) = std::fs::write(&hash_path, format!("{hash}\n")) {
-        warn!(path = %hash_path.display(), error = %e, "failed to write .sha256 sidecar");
-    }
-}
-
-fn sidecar_path(snapshot_path: &Path) -> PathBuf {
-    let mut p = snapshot_path.as_os_str().to_owned();
-    p.push(".sha256");
-    PathBuf::from(p)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,10 +451,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         touch(dir.path(), "snapshot-100-hash.tar.zst");
         touch(dir.path(), "snapshot-200-hash.tar.zst");
-        touch(
-            dir.path(),
-            "incremental-snapshot-200-300-hash.tar.zst",
-        );
+        touch(dir.path(), "incremental-snapshot-200-300-hash.tar.zst");
 
         let idx = SnapshotIndex::new(dir.path().to_path_buf());
         idx.scan().await.unwrap();
@@ -285,15 +472,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         touch(dir.path(), "snapshot-100-hash.tar.zst");
         // Incremental with valid base
-        touch(
-            dir.path(),
-            "incremental-snapshot-100-200-hash.tar.zst",
-        );
+        touch(dir.path(), "incremental-snapshot-100-200-hash.tar.zst");
         // Orphaned incremental (base 999 doesn't exist)
-        touch(
-            dir.path(),
-            "incremental-snapshot-999-1000-hash.tar.zst",
-        );
+        touch(dir.path(), "incremental-snapshot-999-1000-hash.tar.zst");
 
         let idx = SnapshotIndex::new(dir.path().to_path_buf());
         idx.scan().await.unwrap();
@@ -307,10 +488,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         touch(dir.path(), "snapshot-100-hash.tar.zst");
         touch(dir.path(), "snapshot-300-hash.tar.zst");
-        touch(
-            dir.path(),
-            "incremental-snapshot-300-400-hash.tar.zst",
-        );
+        touch(dir.path(), "incremental-snapshot-300-400-hash.tar.zst");
 
         let idx = SnapshotIndex::new(dir.path().to_path_buf());
         idx.scan().await.unwrap();
@@ -430,14 +608,9 @@ mod tests {
             .unwrap();
 
         // Verify sidecar file exists
-        assert!(dir
-            .path()
-            .join("snapshot-100-hash.tar.zst.sha256")
-            .exists());
-        let sidecar_content = std::fs::read_to_string(
-            dir.path().join("snapshot-100-hash.tar.zst.sha256"),
-        )
-        .unwrap();
+        assert!(dir.path().join("snapshot-100-hash.tar.zst.sha256").exists());
+        let sidecar_content =
+            std::fs::read_to_string(dir.path().join("snapshot-100-hash.tar.zst.sha256")).unwrap();
         assert_eq!(sidecar_content.trim(), hash1);
 
         // Second "run" — fresh index, should load hash from sidecar
@@ -451,6 +624,178 @@ mod tests {
             .unwrap();
 
         assert_eq!(hash1, hash2);
+    }
+
+    #[tokio::test]
+    async fn admit_moves_staged_file_and_indexes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = SnapshotIndex::new(dir.path().to_path_buf());
+        idx.scan().await.unwrap();
+
+        std::fs::create_dir_all(idx.staging_dir()).unwrap();
+        std::fs::write(idx.staging_dir().join("snapshot-100-h.tar.zst"), b"data").unwrap();
+
+        let hash = "b".repeat(64);
+        let info = idx.admit("snapshot-100-h.tar.zst", &hash).await.unwrap();
+        assert_eq!(info.slot, 100);
+        assert_eq!(info.sha256.as_deref(), Some(hash.as_str()));
+
+        // File moved out of staging, sidecar written, index updated without a scan
+        assert!(!idx.staging_dir().join("snapshot-100-h.tar.zst").exists());
+        assert!(dir.path().join("snapshot-100-h.tar.zst").exists());
+        assert!(dir.path().join("snapshot-100-h.tar.zst.sha256").exists());
+        assert_eq!(idx.highest_full_slot().await, Some(100));
+    }
+
+    #[tokio::test]
+    async fn admit_rejects_non_snapshot_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = SnapshotIndex::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(idx.staging_dir()).unwrap();
+        std::fs::write(idx.staging_dir().join("garbage.tar.zst"), b"data").unwrap();
+
+        assert!(idx.admit("garbage.tar.zst", &"c".repeat(64)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn retain_removes_excess_full() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "snapshot-100-a.tar.zst");
+        touch(dir.path(), "snapshot-200-b.tar.zst");
+        touch(dir.path(), "snapshot-300-c.tar.zst");
+
+        let idx = SnapshotIndex::new(dir.path().to_path_buf());
+        idx.scan().await.unwrap();
+        idx.retain(2, 4).await.unwrap();
+
+        assert!(dir.path().join("snapshot-300-c.tar.zst").exists());
+        assert!(dir.path().join("snapshot-200-b.tar.zst").exists());
+        assert!(!dir.path().join("snapshot-100-a.tar.zst").exists());
+        // Index pruned without rescan
+        assert_eq!(idx.list().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retain_removes_orphaned_incrementals() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "snapshot-200-a.tar.zst");
+        touch(dir.path(), "incremental-snapshot-200-250-hash.tar.zst");
+        // Orphaned: base slot 100 has no full snapshot
+        touch(dir.path(), "incremental-snapshot-100-150-hash.tar.zst");
+
+        let idx = SnapshotIndex::new(dir.path().to_path_buf());
+        idx.scan().await.unwrap();
+        idx.retain(2, 4).await.unwrap();
+
+        assert!(dir
+            .path()
+            .join("incremental-snapshot-200-250-hash.tar.zst")
+            .exists());
+        assert!(!dir
+            .path()
+            .join("incremental-snapshot-100-150-hash.tar.zst")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn retain_removes_excess_incrementals() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "snapshot-100-a.tar.zst");
+        touch(dir.path(), "incremental-snapshot-100-200-a.tar.zst");
+        touch(dir.path(), "incremental-snapshot-100-300-b.tar.zst");
+        touch(dir.path(), "incremental-snapshot-100-400-c.tar.zst");
+
+        let idx = SnapshotIndex::new(dir.path().to_path_buf());
+        idx.scan().await.unwrap();
+        idx.retain(2, 2).await.unwrap();
+
+        // Should keep 2 newest incrementals (400, 300) and remove 200
+        assert!(dir
+            .path()
+            .join("incremental-snapshot-100-400-c.tar.zst")
+            .exists());
+        assert!(dir
+            .path()
+            .join("incremental-snapshot-100-300-b.tar.zst")
+            .exists());
+        assert!(!dir
+            .path()
+            .join("incremental-snapshot-100-200-a.tar.zst")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn clean_staging_removes_stale_and_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = SnapshotIndex::new(dir.path().to_path_buf());
+        let staging = idx.staging_dir();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("snapshot-100-h.tar.zst"), b"stale").unwrap();
+        std::fs::write(staging.join("garbage.bin"), b"junk").unwrap();
+        std::fs::write(
+            staging.join(".cm-chunk-snapshot-300-h.tar.zst-0"),
+            b"chunk",
+        )
+        .unwrap();
+
+        idx.clean_staging(200).await.unwrap();
+
+        // Everything removed, empty staging dir removed too
+        assert!(!staging.exists());
+    }
+
+    #[tokio::test]
+    async fn clean_staging_keeps_fresh_resumable_partials() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = SnapshotIndex::new(dir.path().to_path_buf());
+        let staging = idx.staging_dir();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("snapshot-300-h.tar.zst"), b"partial").unwrap();
+        std::fs::write(staging.join("snapshot-300-h.tar.zst.aria2"), b"ctrl").unwrap();
+        std::fs::write(staging.join("snapshot-100-h.tar.zst"), b"stale").unwrap();
+
+        idx.clean_staging(200).await.unwrap();
+
+        // Fresh payload and its resume marker survive; stale one is gone
+        assert!(staging.join("snapshot-300-h.tar.zst").exists());
+        assert!(staging.join("snapshot-300-h.tar.zst.aria2").exists());
+        assert!(!staging.join("snapshot-100-h.tar.zst").exists());
+    }
+
+    #[tokio::test]
+    async fn clean_staging_removes_orphan_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = SnapshotIndex::new(dir.path().to_path_buf());
+        let staging = idx.staging_dir();
+        std::fs::create_dir_all(&staging).unwrap();
+        // Marker without its payload — even though the slot is fresh
+        std::fs::write(staging.join("snapshot-300-h.tar.zst.aria2"), b"ctrl").unwrap();
+
+        idx.clean_staging(200).await.unwrap();
+        assert!(!staging.exists());
+    }
+
+    #[tokio::test]
+    async fn clean_staging_without_staging_dir_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = SnapshotIndex::new(dir.path().to_path_buf());
+        idx.clean_staging(0).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retain_removes_sidecars_of_deleted_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("snapshot-100-a.tar.zst"), b"x").unwrap();
+        std::fs::write(dir.path().join("snapshot-200-b.tar.zst"), b"y").unwrap();
+        std::fs::write(dir.path().join("snapshot-300-c.tar.zst"), b"z").unwrap();
+
+        let idx = SnapshotIndex::new(dir.path().to_path_buf());
+        idx.scan().await.unwrap();
+        assert!(dir.path().join("snapshot-100-a.tar.zst.sha256").exists());
+
+        idx.retain(2, 4).await.unwrap();
+        assert!(!dir.path().join("snapshot-100-a.tar.zst.sha256").exists());
+        assert!(dir.path().join("snapshot-300-c.tar.zst.sha256").exists());
     }
 
     #[tokio::test]

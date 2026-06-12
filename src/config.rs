@@ -69,6 +69,9 @@ pub struct PeersConfig {
     pub static_peers: Option<StaticPeersConfig>,
     #[serde(default)]
     pub tailscale: Option<TailscaleConfig>,
+    /// Preferred datacenters, best first. Used to rank peers.
+    #[serde(default)]
+    pub dc_affinity: Vec<String>,
 }
 
 impl Default for PeersConfig {
@@ -77,6 +80,7 @@ impl Default for PeersConfig {
             poll_interval: default_poll_interval(),
             static_peers: None,
             tailscale: None,
+            dc_affinity: Vec::new(),
         }
     }
 }
@@ -111,6 +115,7 @@ pub struct DownloadConfig {
     pub max_full_snapshots: u32,
     #[serde(default = "default_max_incremental")]
     pub max_incremental_snapshots: u32,
+    /// Deprecated: use `peers.dc_affinity`. Still honored when the new key is unset.
     #[serde(default)]
     pub dc_affinity: Vec<String>,
     /// Minimum download speed in bytes/sec. Abort if speed stays below this
@@ -205,13 +210,20 @@ impl Default for AutoConfig {
 impl Config {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&contents)?;
-        Ok(config)
+        Self::from_str(&contents)
     }
 
     pub fn from_str(s: &str) -> anyhow::Result<Self> {
         let config: Config = toml::from_str(s)?;
-        Ok(config)
+        Ok(config.normalize())
+    }
+
+    /// Migrate deprecated keys to their current location.
+    fn normalize(mut self) -> Self {
+        if self.peers.dc_affinity.is_empty() && !self.download.dc_affinity.is_empty() {
+            self.peers.dc_affinity = std::mem::take(&mut self.download.dc_affinity);
+        }
+        self
     }
 }
 
@@ -302,7 +314,9 @@ mod tests {
         assert_eq!(ts.port, 14000);
         assert!(matches!(cfg.download.backend, DownloadBackend::Aria2c));
         assert_eq!(cfg.download.parallel_chunks, 8);
-        assert_eq!(cfg.download.dc_affinity, vec!["ams", "fra"]);
+        // Deprecated [download].dc_affinity migrates to peers
+        assert_eq!(cfg.peers.dc_affinity, vec!["ams", "fra"]);
+        assert!(cfg.download.dc_affinity.is_empty());
         assert_eq!(cfg.download.min_speed, 50_000_000);
         assert_eq!(cfg.download.aria2c.binary, "/usr/local/bin/aria2c");
         assert_eq!(
@@ -316,6 +330,39 @@ mod tests {
         assert_eq!(cfg.s3.upload_interval, Duration::from_secs(600));
         assert!(!cfg.auto.enabled);
         assert_eq!(cfg.auto.check_interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn dc_affinity_under_peers() {
+        let cfg = Config::from_str(
+            r#"
+            [node]
+            snapshot_dir = "/tmp"
+
+            [peers]
+            dc_affinity = ["fra", "ams"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.peers.dc_affinity, vec!["fra", "ams"]);
+    }
+
+    #[test]
+    fn peers_dc_affinity_wins_over_deprecated_key() {
+        let cfg = Config::from_str(
+            r#"
+            [node]
+            snapshot_dir = "/tmp"
+
+            [peers]
+            dc_affinity = ["fra"]
+
+            [download]
+            dc_affinity = ["ams"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.peers.dc_affinity, vec!["fra"]);
     }
 
     #[test]

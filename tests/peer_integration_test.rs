@@ -12,7 +12,7 @@ async fn start_server(snap_dir: &std::path::Path) -> String {
     let index = SnapshotIndex::new(snap_dir.to_path_buf());
     index.scan().await.unwrap();
     let metrics = Metrics::new(None);
-    let peer_mgr = PeerManager::new(Default::default(), vec![], metrics.clone());
+    let peer_mgr = PeerManager::new(Default::default(), metrics.clone());
     let state = AppState {
         index,
         peer_mgr,
@@ -46,9 +46,9 @@ async fn peer_manager_polls_two_nodes() {
         static_peers: Some(StaticPeersConfig {
             hosts: vec![addr_a.clone(), addr_b.clone()],
         }),
-        tailscale: None,
+        ..Default::default()
     };
-    let peer_mgr = PeerManager::new(config, vec![], metrics);
+    let peer_mgr = PeerManager::new(config, metrics);
 
     // Run one poll cycle (poll_loop runs forever, so race with timeout)
     let mgr = peer_mgr.clone();
@@ -94,9 +94,9 @@ async fn ranked_peers_respects_dc_affinity() {
         static_peers: Some(StaticPeersConfig {
             hosts: vec![addr_ams.clone(), addr_fra.clone()],
         }),
-        tailscale: None,
+        ..Default::default()
     };
-    let peer_mgr = PeerManager::new(config, vec![], metrics);
+    let peer_mgr = PeerManager::new(config, metrics);
 
     let mgr = peer_mgr.clone();
     let poll = tokio::spawn(async move { mgr.poll_loop().await });

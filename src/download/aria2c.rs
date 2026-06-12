@@ -3,18 +3,19 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tracing::info;
 
+use super::DownloadResult;
 use crate::config::Aria2cConfig;
 
 /// Download a file using aria2c subprocess.
 ///
-/// Returns total bytes downloaded (from file size after download).
+/// Returns bytes downloaded and SHA-256 digest of the output file.
 pub async fn download(
     config: &Aria2cConfig,
     url: &str,
     dir: &Path,
     filename: &str,
     min_speed: u64,
-) -> Result<u64> {
+) -> Result<DownloadResult> {
     info!(url, filename, "downloading via aria2c");
 
     let mut cmd = tokio::process::Command::new(&config.binary);
@@ -52,6 +53,11 @@ pub async fn download(
     let meta = tokio::fs::metadata(&dest)
         .await
         .context("aria2c output file missing")?;
+    let bytes = meta.len();
 
-    Ok(meta.len())
+    let sha256 = tokio::task::spawn_blocking(move || crate::snapshot::sha256_file(&dest))
+        .await
+        .context("hash task panicked")??;
+
+    Ok(DownloadResult { bytes, sha256 })
 }

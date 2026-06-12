@@ -20,6 +20,9 @@ enum Commands {
     Fetch {
         #[arg(short, long, default_value = "/etc/cm/config.toml")]
         config: PathBuf,
+        /// Bypass the min_slots_behind freshness gate
+        #[arg(long)]
+        force: bool,
     },
     /// Query running daemon's API, print peer table + snapshot info
     Status {
@@ -54,9 +57,9 @@ async fn main() -> anyhow::Result<()> {
             let cfg = cm::config::Config::load(&path)?;
             cm::daemon::run(cfg).await
         }
-        Commands::Fetch { config: path } => {
+        Commands::Fetch { config: path, force } => {
             let cfg = cm::config::Config::load(&path)?;
-            cm::daemon::fetch_once(cfg).await
+            cm::daemon::fetch_once(cfg, force).await
         }
         Commands::Status { url } => {
             cm::daemon::print_status(&url).await

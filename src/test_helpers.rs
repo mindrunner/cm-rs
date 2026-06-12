@@ -27,7 +27,7 @@ pub async fn start_test_server(snap_dir: &Path) -> (String, JoinHandle<()>) {
 /// Start an API server with a pre-built index.
 pub async fn start_test_server_with_index(index: SnapshotIndex) -> (String, JoinHandle<()>) {
     let metrics = Metrics::new(None);
-    let peer_mgr = PeerManager::new(PeersConfig::default(), vec![], metrics.clone());
+    let peer_mgr = PeerManager::new(PeersConfig::default(), metrics.clone());
     let state = AppState {
         index,
         peer_mgr,
@@ -61,7 +61,7 @@ pub fn test_config(snap_dir: &Path, peer_addrs: Vec<String>) -> Config {
             } else {
                 Some(StaticPeersConfig { hosts: peer_addrs })
             },
-            tailscale: None,
+            ..Default::default()
         },
         download: DownloadConfig {
             min_slots_behind: 0,
