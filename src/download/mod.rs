@@ -47,25 +47,24 @@ async fn download_one_file(
     // Reuse a previously staged file whose contents already match the
     // peer-reported hash (e.g. a verified full kept after a staleness bail) —
     // hashing is minutes, re-downloading is hours.
-    if let Some(ref expected) = file.sha256 {
-        if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
-            let path = dest.clone();
-            if let Ok(Ok(hash)) =
-                tokio::task::spawn_blocking(move || crate::snapshot::sha256_file(&path)).await
-            {
-                if hash == *expected {
-                    let bytes = tokio::fs::metadata(&dest).await?.len();
-                    info!(
-                        file = file.file_name,
-                        "reusing staged file with matching checksum"
-                    );
-                    return Ok(DownloadedFile {
-                        file_name: file.file_name.clone(),
-                        sha256: hash,
-                        bytes,
-                    });
-                }
-            }
+    if let Some(ref expected) = file.sha256
+        && tokio::fs::try_exists(&dest).await.unwrap_or(false)
+    {
+        let path = dest.clone();
+        if let Ok(Ok(hash)) =
+            tokio::task::spawn_blocking(move || crate::snapshot::sha256_file(&path)).await
+            && hash == *expected
+        {
+            let bytes = tokio::fs::metadata(&dest).await?.len();
+            info!(
+                file = file.file_name,
+                "reusing staged file with matching checksum"
+            );
+            return Ok(DownloadedFile {
+                file_name: file.file_name.clone(),
+                sha256: hash,
+                bytes,
+            });
         }
     }
 
@@ -74,8 +73,14 @@ async fn download_one_file(
             builtin::download(&url, &dest, config.parallel_chunks, config.min_speed).await?
         }
         crate::config::DownloadBackend::Aria2c => {
-            aria2c::download(&config.aria2c, &url, tmp_dir, &file.file_name, config.min_speed)
-                .await?
+            aria2c::download(
+                &config.aria2c,
+                &url,
+                tmp_dir,
+                &file.file_name,
+                config.min_speed,
+            )
+            .await?
         }
     };
 
@@ -186,7 +191,12 @@ impl DownloadOrchestrator {
                 );
             }
             match self
-                .execute_plan(plan, decision.best_remote_slot, decision.local_bootstrap, reason)
+                .execute_plan(
+                    plan,
+                    decision.best_remote_slot,
+                    decision.local_bootstrap,
+                    reason,
+                )
                 .await
             {
                 Ok(true) => return Ok(true),
@@ -276,9 +286,7 @@ impl DownloadOrchestrator {
         local_bootstrap: u64,
     ) -> Result<u64> {
         let snap_dir = self.index.dir();
-        if plan.incremental_only
-            && !snapshot::file_complete(snap_dir, &plan.full.file_name).await
-        {
+        if plan.incremental_only && !snapshot::file_complete(snap_dir, &plan.full.file_name).await {
             anyhow::bail!(
                 "incremental-only plan requires base full on disk: {}",
                 plan.full.file_name
@@ -295,7 +303,10 @@ impl DownloadOrchestrator {
         };
 
         if full_local {
-            info!(file = plan.full.file_name, "already exists locally, skipping download");
+            info!(
+                file = plan.full.file_name,
+                "already exists locally, skipping download"
+            );
         }
         if inc_local {
             info!(
@@ -357,8 +368,13 @@ impl DownloadOrchestrator {
         let inc_dl = match inc_dl {
             Some(dl) => Some(dl),
             None if plan.incremental.is_some() && !inc_local => {
-                self.try_fetch_incremental(plan.full.slot, local_bootstrap, &tmp_dir, &plan.peer_addr)
-                    .await
+                self.try_fetch_incremental(
+                    plan.full.slot,
+                    local_bootstrap,
+                    &tmp_dir,
+                    &plan.peer_addr,
+                )
+                .await
             }
             None => None,
         };
@@ -544,9 +560,7 @@ mod tests {
         index.scan().await.unwrap();
 
         let remote = SnapshotInfo {
-            sha256: Some(
-                "0000000000000000000000000000000000000000000000000000000000000000".into(),
-            ),
+            sha256: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
             ..make_snap(100, true, None)
         };
         assert!(orch.exists_locally(&remote).await);

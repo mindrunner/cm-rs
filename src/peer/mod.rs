@@ -84,13 +84,13 @@ impl PeerManager {
                 static_cfg.hosts.clone(),
             )));
         }
-        if let Some(ref ts_cfg) = self.config.tailscale {
-            if ts_cfg.enabled {
-                sources.push(PeerDiscoverySource::Tailscale(TailscaleDiscovery::new(
-                    ts_cfg.tag.clone(),
-                    ts_cfg.port,
-                )));
-            }
+        if let Some(ref ts_cfg) = self.config.tailscale
+            && ts_cfg.enabled
+        {
+            sources.push(PeerDiscoverySource::Tailscale(TailscaleDiscovery::new(
+                ts_cfg.tag.clone(),
+                ts_cfg.port,
+            )));
         }
         sources
     }
@@ -127,7 +127,10 @@ impl PeerManager {
 
     pub async fn poll_loop(&self) {
         let interval = self.config.poll_interval;
-        info!(interval_secs = interval.as_secs(), "starting peer poll loop");
+        info!(
+            interval_secs = interval.as_secs(),
+            "starting peer poll loop"
+        );
 
         loop {
             let addrs = self.discover_peers().await;
@@ -361,10 +364,7 @@ mod tests {
     fn peer_highest_slot_with_valid_incremental() {
         let peer = PeerInfo {
             addr: "test:1".into(),
-            snapshots: vec![
-                make_snap(100, true, None),
-                make_snap(200, false, Some(100)),
-            ],
+            snapshots: vec![make_snap(100, true, None), make_snap(200, false, Some(100))],
             stats: PeerStats::default(),
         };
         assert_eq!(peer.highest_slot(), 200);

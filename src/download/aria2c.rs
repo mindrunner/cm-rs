@@ -40,10 +40,7 @@ pub async fn download(
 
     cmd.arg(url);
 
-    let status = cmd
-        .status()
-        .await
-        .context("failed to spawn aria2c")?;
+    let status = cmd.status().await.context("failed to spawn aria2c")?;
 
     if !status.success() {
         anyhow::bail!("aria2c exited with {}", status);

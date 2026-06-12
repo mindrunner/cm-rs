@@ -1,6 +1,6 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -304,17 +304,15 @@ async fn sequential_download(
         .to_string_lossy()
         .to_string();
 
-    let progress_handle = if let Some(size) = total_size {
-        Some(spawn_progress_watchdog(
+    let progress_handle = total_size.map(|size| {
+        spawn_progress_watchdog(
             Arc::clone(&downloaded),
             size,
             file_name,
             min_speed,
             Arc::clone(&abort),
-        ))
-    } else {
-        None
-    };
+        )
+    });
 
     let mut file = tokio::fs::File::create(dest).await?;
     let mut stream = resp.bytes_stream();

@@ -173,6 +173,12 @@ pub struct StreamingHasher {
     hasher: Sha256,
 }
 
+impl Default for StreamingHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamingHasher {
     pub fn new() -> Self {
         Self {
@@ -263,24 +269,16 @@ mod tests {
 
     #[test]
     fn multi_hyphen_hash() {
-        let info = SnapshotInfo::from_filename(
-            "snapshot-12345-abc-def-ghi.tar.zst",
-            100,
-            0,
-        )
-        .unwrap();
+        let info =
+            SnapshotInfo::from_filename("snapshot-12345-abc-def-ghi.tar.zst", 100, 0).unwrap();
         assert_eq!(info.slot, 12345);
         assert!(info.is_full());
     }
 
     #[test]
     fn incremental_is_not_full() {
-        let info = SnapshotInfo::from_filename(
-            "incremental-snapshot-100-200-hash.tar.zst",
-            100,
-            0,
-        )
-        .unwrap();
+        let info = SnapshotInfo::from_filename("incremental-snapshot-100-200-hash.tar.zst", 100, 0)
+            .unwrap();
         assert!(!info.is_full());
         assert_eq!(info.snapshot_type, SnapshotType::Incremental);
     }
@@ -386,10 +384,7 @@ mod tests {
 
     #[test]
     fn hash_component_multi_hyphen() {
-        assert_eq!(
-            hash_component("snapshot-100-abc-def.tar.zst"),
-            "abc-def"
-        );
+        assert_eq!(hash_component("snapshot-100-abc-def.tar.zst"), "abc-def");
     }
 
     #[test]

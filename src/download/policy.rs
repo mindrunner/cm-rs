@@ -111,7 +111,7 @@ pub fn rank_incremental_plans(
         ));
     }
 
-    plans.sort_by(|a, b| b.0.cmp(&a.0));
+    plans.sort_by_key(|(slot, _)| std::cmp::Reverse(*slot));
     plans.into_iter().map(|(_, plan)| plan).collect()
 }
 
@@ -125,13 +125,14 @@ pub fn rank_newer_full_plans(
     let mut plans: Vec<(u64, DownloadPlan)> = Vec::new();
 
     for peer in peers {
-        for full in peer.snapshots.iter().filter(|s| s.is_full() && s.slot > floor) {
+        for full in peer
+            .snapshots
+            .iter()
+            .filter(|s| s.is_full() && s.slot > floor)
+        {
             let incremental = best_incremental_for(&peer.snapshots, full.slot, 0).cloned();
 
-            let resulting_bootstrap = incremental
-                .as_ref()
-                .map(|i| i.slot)
-                .unwrap_or(full.slot);
+            let resulting_bootstrap = incremental.as_ref().map(|i| i.slot).unwrap_or(full.slot);
             if resulting_bootstrap <= local_bootstrap {
                 continue;
             }
@@ -148,7 +149,7 @@ pub fn rank_newer_full_plans(
         }
     }
 
-    plans.sort_by(|a, b| b.0.cmp(&a.0));
+    plans.sort_by_key(|(slot, _)| std::cmp::Reverse(*slot));
     plans.into_iter().map(|(_, plan)| plan).collect()
 }
 
@@ -535,7 +536,10 @@ mod tests {
             ],
         )];
         let decision = decide(&local, &peers, 100);
-        assert!(matches!(decision.reason, Some(FetchReason::Behind { diff: 1040 })));
+        assert!(matches!(
+            decision.reason,
+            Some(FetchReason::Behind { diff: 1040 })
+        ));
         assert!(decision.plans[0].incremental_only);
         assert_eq!(decision.plans[0].incremental.as_ref().unwrap().slot, 1980);
         assert!(!decision.plans[1].incremental_only);
@@ -549,10 +553,7 @@ mod tests {
         // to a 100 GB full download.
         let local = vec![make_snap(1000, true, None)];
         let peers = vec![
-            make_peer(
-                "host:1",
-                vec![make_snap(1980, false, Some(1000))],
-            ),
+            make_peer("host:1", vec![make_snap(1980, false, Some(1000))]),
             make_peer(
                 "host:2",
                 vec![
@@ -621,7 +622,10 @@ mod tests {
         let local = vec![make_snap(200, true, None)];
         let peers = vec![make_peer("host:1", vec![make_snap(250, true, None)])];
         let decision = decide(&local, &peers, 100);
-        assert_eq!(decision.gate, FullFetchGate::NotFarEnoughBehind { diff: 50 });
+        assert_eq!(
+            decision.gate,
+            FullFetchGate::NotFarEnoughBehind { diff: 50 }
+        );
         assert!(decision.plans.is_empty());
         assert_eq!(decision.reason, None);
     }
@@ -686,12 +690,19 @@ mod tests {
         let peers = vec![
             make_peer(
                 "host:1",
-                vec![make_snap(5000, true, None), make_snap(5050, false, Some(5000))],
+                vec![
+                    make_snap(5000, true, None),
+                    make_snap(5050, false, Some(5000)),
+                ],
             ),
             make_peer("host:2", vec![make_snap(1090, true, None)]),
         ];
         let decision = decide(&local, &peers, 100);
-        let fulls: Vec<_> = decision.plans.iter().filter(|p| !p.incremental_only).collect();
+        let fulls: Vec<_> = decision
+            .plans
+            .iter()
+            .filter(|p| !p.incremental_only)
+            .collect();
         assert_eq!(fulls.len(), 1);
         assert_eq!(fulls[0].full.slot, 5000);
     }

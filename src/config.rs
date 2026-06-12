@@ -60,10 +60,7 @@ pub struct NodeConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PeersConfig {
-    #[serde(
-        default = "default_poll_interval",
-        with = "humantime_serde"
-    )]
+    #[serde(default = "default_poll_interval", with = "humantime_serde")]
     pub poll_interval: Duration,
     #[serde(default, rename = "static")]
     pub static_peers: Option<StaticPeersConfig>,
@@ -180,10 +177,7 @@ pub struct S3Config {
     pub prefix: String,
     #[serde(default)]
     pub path_style: bool,
-    #[serde(
-        default = "default_upload_interval",
-        with = "humantime_serde"
-    )]
+    #[serde(default = "default_upload_interval", with = "humantime_serde")]
     pub upload_interval: Duration,
 }
 
@@ -191,10 +185,7 @@ pub struct S3Config {
 pub struct AutoConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(
-        default = "default_check_interval",
-        with = "humantime_serde"
-    )]
+    #[serde(default = "default_check_interval", with = "humantime_serde")]
     pub check_interval: Duration,
 }
 
@@ -210,12 +201,7 @@ impl Default for AutoConfig {
 impl Config {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        Self::from_str(&contents)
-    }
-
-    pub fn from_str(s: &str) -> anyhow::Result<Self> {
-        let config: Config = toml::from_str(s)?;
-        Ok(config.normalize())
+        contents.parse()
     }
 
     /// Migrate deprecated keys to their current location.
@@ -227,8 +213,19 @@ impl Config {
     }
 }
 
+impl std::str::FromStr for Config {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        let config: Config = toml::from_str(s)?;
+        Ok(config.normalize())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
 
     #[test]

@@ -57,16 +57,15 @@ async fn main() -> anyhow::Result<()> {
             let cfg = cm::config::Config::load(&path)?;
             cm::daemon::run(cfg).await
         }
-        Commands::Fetch { config: path, force } => {
+        Commands::Fetch {
+            config: path,
+            force,
+        } => {
             let cfg = cm::config::Config::load(&path)?;
             cm::daemon::fetch_once(cfg, force).await
         }
-        Commands::Status { url } => {
-            cm::daemon::print_status(&url).await
-        }
-        Commands::Peers { url } => {
-            cm::daemon::print_peers(&url).await
-        }
+        Commands::Status { url } => cm::daemon::print_status(&url).await,
+        Commands::Peers { url } => cm::daemon::print_peers(&url).await,
         Commands::Upload { config: path } => {
             let cfg = cm::config::Config::load(&path)?;
             cm::daemon::upload_once(cfg).await

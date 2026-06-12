@@ -5,7 +5,7 @@ use cm::peer::PeerManager;
 use cm::server::{self, AppState};
 
 fn touch(dir: &std::path::Path, name: &str) {
-    std::fs::write(dir.join(name), &[0u8; 64]).unwrap();
+    std::fs::write(dir.join(name), [0u8; 64]).unwrap();
 }
 
 async fn start_server(snap_dir: &std::path::Path) -> String {

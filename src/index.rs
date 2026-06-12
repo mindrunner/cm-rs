@@ -141,8 +141,7 @@ impl SnapshotIndex {
             }
         }
 
-        let name_set: std::collections::HashSet<&str> =
-            names.iter().map(|n| n.as_str()).collect();
+        let name_set: std::collections::HashSet<&str> = names.iter().map(|n| n.as_str()).collect();
         for name in &names {
             let is_marker = name.ends_with(".aria2");
             let payload = name.strip_suffix(".aria2").unwrap_or(name);
@@ -231,11 +230,11 @@ impl SnapshotIndex {
         let events = tokio::task::block_in_place(|| ino.read_events_blocking(&mut buf))?;
         let mut changed = false;
         for event in events {
-            if let Some(name) = event.name.and_then(|n| n.to_str()) {
-                if snapshot::is_archive_name(name) {
-                    debug!(file = name, "inotify event");
-                    changed = true;
-                }
+            if let Some(name) = event.name.and_then(|n| n.to_str())
+                && snapshot::is_archive_name(name)
+            {
+                debug!(file = name, "inotify event");
+                changed = true;
             }
         }
         if changed {
@@ -307,10 +306,11 @@ fn scan_directory_with_hashes(
 
         if let Some(mut info) = SnapshotInfo::from_filename(name_str, meta.len(), modified) {
             // Reuse in-memory cached hash if file hasn't changed
-            if let Some(prev) = previous.get(name_str) {
-                if prev.size == info.size && prev.modified_at == info.modified_at {
-                    info.sha256 = prev.sha256.clone();
-                }
+            if let Some(prev) = previous.get(name_str)
+                && prev.size == info.size
+                && prev.modified_at == info.modified_at
+            {
+                info.sha256 = prev.sha256.clone();
             }
             // Try loading from sidecar .sha256 file
             if info.sha256.is_none() {
@@ -352,8 +352,8 @@ async fn cleanup_old_snapshots(
     let mut incrementals = list_snapshots_by_type(dir, "incremental-snapshot-").await?;
 
     // Sort newest first by slot extracted from filename
-    fulls.sort_by(|a, b| b.1.cmp(&a.1));
-    incrementals.sort_by(|a, b| b.1.cmp(&a.1));
+    fulls.sort_by_key(|(_, slot)| std::cmp::Reverse(*slot));
+    incrementals.sort_by_key(|(_, slot)| std::cmp::Reverse(*slot));
 
     let valid_full_slots: std::collections::HashSet<u64> = fulls
         .iter()
@@ -380,11 +380,11 @@ async fn cleanup_old_snapshots(
     let mut kept_incrementals = 0u32;
     for (path, _) in &incrementals {
         let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if let Some(base_slot) = snapshot::incremental_base_slot(fname) {
-            if !valid_full_slots.contains(&base_slot) {
-                remove(path, "orphaned incremental snapshot");
-                continue;
-            }
+        if let Some(base_slot) = snapshot::incremental_base_slot(fname)
+            && !valid_full_slots.contains(&base_slot)
+        {
+            remove(path, "orphaned incremental snapshot");
+            continue;
         }
         kept_incrementals += 1;
         if kept_incrementals > max_incremental {
@@ -429,11 +429,11 @@ fn cleanup_orphan_sidecars(dir: &Path, live: &HashMap<String, SnapshotInfo>) {
             Some(n) => n,
             None => continue,
         };
-        if let Some(snapshot_name) = name_str.strip_suffix(".sha256") {
-            if !live.contains_key(snapshot_name) {
-                debug!(file = name_str, "removing orphan sidecar");
-                std::fs::remove_file(entry.path()).ok();
-            }
+        if let Some(snapshot_name) = name_str.strip_suffix(".sha256")
+            && !live.contains_key(snapshot_name)
+        {
+            debug!(file = name_str, "removing orphan sidecar");
+            std::fs::remove_file(entry.path()).ok();
         }
     }
 }
@@ -443,7 +443,7 @@ mod tests {
     use super::*;
 
     fn touch(dir: &Path, name: &str) {
-        std::fs::write(dir.join(name), &[0u8; 64]).unwrap();
+        std::fs::write(dir.join(name), [0u8; 64]).unwrap();
     }
 
     #[tokio::test]
@@ -687,14 +687,16 @@ mod tests {
         idx.scan().await.unwrap();
         idx.retain(2, 4).await.unwrap();
 
-        assert!(dir
-            .path()
-            .join("incremental-snapshot-200-250-hash.tar.zst")
-            .exists());
-        assert!(!dir
-            .path()
-            .join("incremental-snapshot-100-150-hash.tar.zst")
-            .exists());
+        assert!(
+            dir.path()
+                .join("incremental-snapshot-200-250-hash.tar.zst")
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("incremental-snapshot-100-150-hash.tar.zst")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -710,18 +712,21 @@ mod tests {
         idx.retain(2, 2).await.unwrap();
 
         // Should keep 2 newest incrementals (400, 300) and remove 200
-        assert!(dir
-            .path()
-            .join("incremental-snapshot-100-400-c.tar.zst")
-            .exists());
-        assert!(dir
-            .path()
-            .join("incremental-snapshot-100-300-b.tar.zst")
-            .exists());
-        assert!(!dir
-            .path()
-            .join("incremental-snapshot-100-200-a.tar.zst")
-            .exists());
+        assert!(
+            dir.path()
+                .join("incremental-snapshot-100-400-c.tar.zst")
+                .exists()
+        );
+        assert!(
+            dir.path()
+                .join("incremental-snapshot-100-300-b.tar.zst")
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("incremental-snapshot-100-200-a.tar.zst")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -732,11 +737,7 @@ mod tests {
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::write(staging.join("snapshot-100-h.tar.zst"), b"stale").unwrap();
         std::fs::write(staging.join("garbage.bin"), b"junk").unwrap();
-        std::fs::write(
-            staging.join(".cm-chunk-snapshot-300-h.tar.zst-0"),
-            b"chunk",
-        )
-        .unwrap();
+        std::fs::write(staging.join(".cm-chunk-snapshot-300-h.tar.zst-0"), b"chunk").unwrap();
 
         idx.clean_staging(200).await.unwrap();
 

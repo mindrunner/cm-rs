@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -26,11 +26,7 @@ pub struct S3Uploader {
 }
 
 impl S3Uploader {
-    pub async fn new(
-        config: S3Config,
-        index: SnapshotIndex,
-        metrics: Metrics,
-    ) -> Result<Self> {
+    pub async fn new(config: S3Config, index: SnapshotIndex, metrics: Metrics) -> Result<Self> {
         let mut aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest());
 
         if let Some(ref region) = config.region {
@@ -40,10 +36,10 @@ impl S3Uploader {
         let aws_config = aws_config.load().await;
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
 
-        if let Some(ref endpoint) = config.endpoint {
-            if !endpoint.is_empty() {
-                s3_config = s3_config.endpoint_url(endpoint);
-            }
+        if let Some(ref endpoint) = config.endpoint
+            && !endpoint.is_empty()
+        {
+            s3_config = s3_config.endpoint_url(endpoint);
         }
 
         if config.path_style {
@@ -81,15 +77,20 @@ impl S3Uploader {
 
         let full_slot = best_full.slot;
         let fresh = self.index.list().await;
-        if let Some(incremental) = fresh.iter().find(|s| {
-            !s.is_full() && s.base_slot == Some(full_slot)
-        }) {
+        if let Some(incremental) = fresh
+            .iter()
+            .find(|s| !s.is_full() && s.base_slot == Some(full_slot))
+        {
             let inc_key = self.s3_key(&incremental.file_name);
             if !self.object_exists(&inc_key).await? {
                 match self.upload_snapshot(incremental).await {
                     Ok(()) => uploaded = true,
                     Err(e) => {
-                        warn!(file = incremental.file_name, error = format!("{e:#}"), "incremental upload failed, skipping");
+                        warn!(
+                            file = incremental.file_name,
+                            error = format!("{e:#}"),
+                            "incremental upload failed, skipping"
+                        );
                     }
                 }
             }
@@ -101,7 +102,12 @@ impl S3Uploader {
     async fn upload_snapshot(&self, snap: &SnapshotInfo) -> Result<()> {
         let path = self.index.dir().join(&snap.file_name);
         let key = self.s3_key(&snap.file_name);
-        info!(file = snap.file_name, key, size = snap.size, "uploading to S3");
+        info!(
+            file = snap.file_name,
+            key,
+            size = snap.size,
+            "uploading to S3"
+        );
 
         let start = Instant::now();
 
@@ -147,8 +153,14 @@ impl S3Uploader {
         key: &str,
         file_size: u64,
     ) -> Result<()> {
-        let total_parts = (file_size + MULTIPART_PART_SIZE - 1) / MULTIPART_PART_SIZE;
-        info!(key, file_size, total_parts, part_size = MULTIPART_PART_SIZE, "starting multipart upload");
+        let total_parts = file_size.div_ceil(MULTIPART_PART_SIZE);
+        info!(
+            key,
+            file_size,
+            total_parts,
+            part_size = MULTIPART_PART_SIZE,
+            "starting multipart upload"
+        );
 
         let create = self
             .client
@@ -165,9 +177,7 @@ impl S3Uploader {
             .context("missing upload_id from create_multipart_upload")?
             .to_string();
 
-        let result = self
-            .upload_parts(path, key, &upload_id, file_size)
-            .await;
+        let result = self.upload_parts(path, key, &upload_id, file_size).await;
 
         match result {
             Ok(parts) => {
@@ -209,7 +219,7 @@ impl S3Uploader {
         upload_id: &str,
         file_size: u64,
     ) -> Result<Vec<CompletedPart>> {
-        let total_parts = ((file_size + MULTIPART_PART_SIZE - 1) / MULTIPART_PART_SIZE) as i32;
+        let total_parts = file_size.div_ceil(MULTIPART_PART_SIZE) as i32;
 
         let part_specs: Vec<(i32, u64, u64)> = (0..total_parts)
             .map(|i| {
@@ -221,11 +231,8 @@ impl S3Uploader {
             .collect();
 
         let uploaded = Arc::new(AtomicU64::new(0));
-        let progress_handle = spawn_upload_progress(
-            Arc::clone(&uploaded),
-            file_size,
-            key.to_string(),
-        );
+        let progress_handle =
+            spawn_upload_progress(Arc::clone(&uploaded), file_size, key.to_string());
 
         let path: Arc<std::path::Path> = Arc::from(path);
         let key: Arc<str> = Arc::from(key);

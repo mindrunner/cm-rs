@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use prometheus_client::encoding::text::encode;
 use prometheus_client::encoding::EncodeLabelSet;
+use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
-use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
+use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -61,11 +61,10 @@ impl Metrics {
         let mut registry = Registry::default();
 
         let reg = match cluster_name {
-            Some(name) => registry
-                .sub_registry_with_label((
-                    std::borrow::Cow::Borrowed("cluster"),
-                    std::borrow::Cow::Owned(name.to_string()),
-                )),
+            Some(name) => registry.sub_registry_with_label((
+                std::borrow::Cow::Borrowed("cluster"),
+                std::borrow::Cow::Owned(name.to_string()),
+            )),
             None => &mut registry,
         };
 

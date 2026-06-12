@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
-use axum::Router;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use tracing::info;
@@ -72,9 +72,7 @@ async fn serve_snapshot(
 
     // Handle range requests
     if let Some(range_header) = headers.get(header::RANGE) {
-        let range_str = range_header
-            .to_str()
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let range_str = range_header.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
 
         if let Some((start, end)) = parse_range(range_str, total_size) {
             let length = end - start + 1;
@@ -122,9 +120,7 @@ pub fn parse_range(range: &str, total: u64) -> Option<(u64, u64)> {
         return None;
     }
     let range = range.strip_prefix("bytes=")?;
-    let mut parts = range.splitn(2, '-');
-    let start_str = parts.next()?;
-    let end_str = parts.next()?;
+    let (start_str, end_str) = range.split_once('-')?;
 
     if start_str.is_empty() {
         // Suffix range: bytes=-N means last N bytes
@@ -147,9 +143,7 @@ pub fn parse_range(range: &str, total: u64) -> Option<(u64, u64)> {
     }
 }
 
-async fn list_peers(
-    State(state): State<Arc<AppState>>,
-) -> Json<Vec<crate::peer::PeerInfo>> {
+async fn list_peers(State(state): State<Arc<AppState>>) -> Json<Vec<crate::peer::PeerInfo>> {
     Json(state.peer_mgr.list_peers().await)
 }
 
@@ -160,9 +154,7 @@ pub struct StatusResponse {
     pub peer_count: usize,
 }
 
-async fn status(
-    State(state): State<Arc<AppState>>,
-) -> Json<StatusResponse> {
+async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let local_snapshots = state.index.list().await;
     let highest_slot = state.index.highest_slot().await;
     let peer_count = state.peer_mgr.peer_count().await;
@@ -173,14 +165,9 @@ async fn status(
     })
 }
 
-async fn metrics_handler(
-    State(metrics): State<Arc<Metrics>>,
-) -> impl IntoResponse {
+async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> impl IntoResponse {
     let body = metrics.encode();
-    (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        body,
-    )
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
 /// Blockdaemon-compatible `/v1/best_snapshots` response types.
@@ -231,7 +218,10 @@ async fn best_snapshots_compat(
     for full in &full_snaps {
         let mut files = vec![snap_to_compat_file(full)];
         // Attach matching incrementals
-        for inc in snaps.iter().filter(|s| !s.is_full() && s.base_slot == Some(full.slot)) {
+        for inc in snaps
+            .iter()
+            .filter(|s| !s.is_full() && s.base_slot == Some(full.slot))
+        {
             files.push(snap_to_compat_file(inc));
         }
         let total_size: u64 = files.iter().map(|f| f.size).sum();
@@ -241,7 +231,7 @@ async fn best_snapshots_compat(
             hash,
             files,
             size: total_size,
-            target: format!("http://localhost/api/v1/snapshot"),
+            target: "http://localhost/api/v1/snapshot".to_string(),
             updated_at: chrono_or_epoch(full.modified_at),
         });
     }
@@ -263,10 +253,7 @@ fn snap_to_compat_file(s: &crate::snapshot::SnapshotInfo) -> CompatSnapshotFile 
 fn chrono_or_epoch(ts: u64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
     let dt = UNIX_EPOCH + Duration::from_secs(ts);
-    let secs = dt
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let secs = dt.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     format!(
         "{}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         1970 + secs / 31_557_600,
@@ -276,6 +263,24 @@ fn chrono_or_epoch(ts: u64) -> String {
         (secs % 3600) / 60,
         secs % 60
     )
+}
+
+/// Start the main API server.
+pub async fn serve_api(state: AppState, addr: &str) -> anyhow::Result<()> {
+    let router = api_router(state);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!(addr, "API server listening");
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
+/// Start the metrics server on a separate port.
+pub async fn serve_metrics(metrics: Metrics, addr: &str) -> anyhow::Result<()> {
+    let router = metrics_router(metrics);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!(addr, "metrics server listening");
+    axum::serve(listener, router).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -332,22 +337,4 @@ mod tests {
         // bytes=-2000 on a 1000-byte file should start at 0
         assert_eq!(parse_range("bytes=-2000", 1000), Some((0, 999)));
     }
-}
-
-/// Start the main API server.
-pub async fn serve_api(state: AppState, addr: &str) -> anyhow::Result<()> {
-    let router = api_router(state);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!(addr, "API server listening");
-    axum::serve(listener, router).await?;
-    Ok(())
-}
-
-/// Start the metrics server on a separate port.
-pub async fn serve_metrics(metrics: Metrics, addr: &str) -> anyhow::Result<()> {
-    let router = metrics_router(metrics);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!(addr, "metrics server listening");
-    axum::serve(listener, router).await?;
-    Ok(())
 }
