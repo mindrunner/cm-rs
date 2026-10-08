@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tracing::info;
 
-use super::DownloadResult;
+use super::{DownloadResult, SlowTransfer};
 use crate::config::Aria2cConfig;
 
 /// Download a file using aria2c subprocess.
@@ -42,6 +42,10 @@ pub async fn download(
 
     let status = cmd.status().await.context("failed to spawn aria2c")?;
 
+    // aria2c exit code 5: aborted because download speed was too slow.
+    if status.code() == Some(5) {
+        return Err(SlowTransfer.into());
+    }
     if !status.success() {
         anyhow::bail!("aria2c exited with {}", status);
     }
