@@ -142,7 +142,7 @@ for a fully commented example.
 | `min_slots_behind`       | u64      | `2500`    | Gate for **full** downloads: fetch a full only when the local bootstrap slot is at least this far behind the best peer (or on bootstrap), and only when it improves the bootstrap by at least this much. Incremental top-ups on the local full are not gated. |
 | `max_full_snapshots`     | u32      | `2`       | Max full snapshots to retain                   |
 | `max_incremental_snapshots` | u32   | `4`       | Max incremental snapshots to retain            |
-| `min_speed`              | u64      | `0`       | Min bytes/sec; abort after 60s below (0 = off) |
+| `min_speed`              | u64      | `0`       | Min bytes/sec; abort after 60s below and skip that peer this cycle. Not enforced on the last candidate peer. A 60s stall always aborts |
 
 ### `[download.aria2c]`
 
