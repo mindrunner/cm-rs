@@ -185,7 +185,12 @@ sudo systemctl enable --now cm
 ```
 
 The service runs `cm fetch` before starting the daemon to ensure an initial
-snapshot is available.
+snapshot is available. A failed fetch does not block the daemon.
+
+`cm fetch` exits non-zero when no usable local snapshot exists, or when the
+local bootstrap is at least `min_slots_behind` behind the best peer, and no
+download landed. A failed incremental top-up within tolerance exits 0. Gate a
+validator start on it so the validator never boots from a stale snapshot.
 
 ### Docker Compose
 
