@@ -73,6 +73,14 @@ and offline-too-long recovery, plus cheap incremental top-ups.
 One attemptable unit: a peer, a full snapshot, an optional incremental, and
 whether the full is already local (**incremental-only**).
 
+## Speed floor
+
+`min_speed` steers a cycle away from slow peers: a transfer below it for 60s
+is aborted and that peer's other plans are skipped for the cycle. The floor
+applies only while a plan from another usable peer remains, so the last
+candidate is never abandoned while it makes progress. A transfer that moves
+no bytes for 60s is always aborted.
+
 ## Download backend
 
 An adapter that fetches one URL to one destination and returns bytes +

@@ -1,6 +1,8 @@
 //! Pure fetch policy: local snapshots + peer snapshots + config in, ordered
 //! download plans out. No I/O — every branch is testable without disk or HTTP.
 
+use std::collections::HashSet;
+
 use crate::peer::PeerInfo;
 use crate::snapshot::{SnapshotInfo, SnapshotType};
 
@@ -289,6 +291,37 @@ pub fn decide(
         best_remote_slot,
         gate,
         reason,
+    }
+}
+
+/// How to attempt one plan of a cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanAttempt {
+    /// The peer tripped the speed floor earlier this cycle and another usable
+    /// peer's plan remains.
+    Skip,
+    /// Attempt with this speed floor; 0 aborts only on a stall.
+    Run { min_speed: u64 },
+}
+
+/// Decide how to attempt `plans[i]` given the peers that already tripped the
+/// speed floor this cycle. The floor only applies while a plan from another
+/// usable peer remains, so the last candidate is never abandoned while it is
+/// still making progress.
+pub fn plan_attempt(
+    plans: &[DownloadPlan],
+    i: usize,
+    slow_peers: &HashSet<&str>,
+    min_speed: u64,
+) -> PlanAttempt {
+    let peer = plans[i].peer_addr.as_str();
+    let fallback_left = plans[i + 1..]
+        .iter()
+        .any(|p| p.peer_addr != peer && !slow_peers.contains(p.peer_addr.as_str()));
+    match (slow_peers.contains(peer), fallback_left) {
+        (true, true) => PlanAttempt::Skip,
+        (_, true) => PlanAttempt::Run { min_speed },
+        (_, false) => PlanAttempt::Run { min_speed: 0 },
     }
 }
 
@@ -764,5 +797,65 @@ mod tests {
         };
         assert_eq!(plan_resulting_bootstrap(&with_inc), 1500);
         assert_eq!(plan_resulting_bootstrap(&full_only), 1000);
+    }
+
+    fn full_plan(peer: &str, slot: u64) -> DownloadPlan {
+        DownloadPlan {
+            peer_addr: peer.into(),
+            full: make_snap(slot, true, None),
+            incremental: None,
+            incremental_only: false,
+        }
+    }
+
+    #[test]
+    fn plan_attempt_enforces_floor_while_another_peer_remains() {
+        let plans = vec![full_plan("a:1", 300), full_plan("b:1", 200)];
+        let slow = HashSet::new();
+        assert_eq!(
+            plan_attempt(&plans, 0, &slow, 50),
+            PlanAttempt::Run { min_speed: 50 }
+        );
+        assert_eq!(
+            plan_attempt(&plans, 1, &slow, 50),
+            PlanAttempt::Run { min_speed: 0 }
+        );
+    }
+
+    #[test]
+    fn plan_attempt_drops_floor_when_only_slow_or_same_peer_remain() {
+        // wt-2 2026-10-06: every peer below the floor, nothing ever landed.
+        let plans = vec![
+            full_plan("a:1", 400),
+            full_plan("b:1", 300),
+            full_plan("a:1", 200),
+        ];
+        let slow: HashSet<&str> = ["a:1"].into();
+        assert_eq!(
+            plan_attempt(&plans, 1, &slow, 50),
+            PlanAttempt::Run { min_speed: 0 }
+        );
+        let same_peer = vec![full_plan("a:1", 400), full_plan("a:1", 300)];
+        assert_eq!(
+            plan_attempt(&same_peer, 0, &HashSet::new(), 50),
+            PlanAttempt::Run { min_speed: 0 }
+        );
+    }
+
+    #[test]
+    fn plan_attempt_skips_slow_peer_only_while_fallback_remains() {
+        let plans = vec![
+            full_plan("a:1", 400),
+            full_plan("a:1", 300),
+            full_plan("b:1", 200),
+            full_plan("a:1", 100),
+        ];
+        let slow: HashSet<&str> = ["a:1"].into();
+        assert_eq!(plan_attempt(&plans, 1, &slow, 50), PlanAttempt::Skip);
+        // b:1 failed for another reason; a:1 is all that is left.
+        assert_eq!(
+            plan_attempt(&plans, 3, &slow, 50),
+            PlanAttempt::Run { min_speed: 0 }
+        );
     }
 }
