@@ -2,6 +2,7 @@ pub mod aria2c;
 pub mod builtin;
 pub mod policy;
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
@@ -15,7 +16,7 @@ use crate::peer::PeerManager;
 use crate::snapshot::{self, SnapshotInfo};
 
 pub use policy::{
-    DownloadPlan, FetchDecision, FetchReason, FullFetchGate, agave_bootstrap_slot,
+    DownloadPlan, FetchDecision, FetchReason, FullFetchGate, PlanAttempt, agave_bootstrap_slot,
     build_download_plan, decide, plan_resulting_bootstrap, rank_incremental_plans,
     rank_newer_full_plans,
 };
@@ -25,6 +26,19 @@ pub struct DownloadResult {
     pub bytes: u64,
     pub sha256: String,
 }
+
+/// The progress watchdog gave up on a transfer: below `min_speed`, or no
+/// bytes at all, for a whole window.
+#[derive(Debug)]
+pub struct SlowTransfer;
+
+impl std::fmt::Display for SlowTransfer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("download aborted: speed below minimum threshold")
+    }
+}
+
+impl std::error::Error for SlowTransfer {}
 
 /// What one fetch cycle achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,12 +61,14 @@ struct DownloadedFile {
 }
 
 /// Download a single snapshot file to `tmp_dir`, verify its checksum, and
-/// return metadata about the downloaded file.
+/// return metadata about the downloaded file. `min_speed` overrides the
+/// configured floor (0 = abort only on a stall).
 async fn download_one_file(
     config: &DownloadConfig,
     peer_addr: &str,
     file: &SnapshotInfo,
     tmp_dir: &Path,
+    min_speed: u64,
 ) -> Result<DownloadedFile> {
     let url = format!("http://{}/api/v1/snapshot/{}", peer_addr, file.file_name);
     let dest = tmp_dir.join(&file.file_name);
@@ -83,17 +99,10 @@ async fn download_one_file(
 
     let result = match config.backend {
         crate::config::DownloadBackend::Builtin => {
-            builtin::download(&url, &dest, config.parallel_chunks, config.min_speed).await?
+            builtin::download(&url, &dest, config.parallel_chunks, min_speed).await?
         }
         crate::config::DownloadBackend::Aria2c => {
-            aria2c::download(
-                &config.aria2c,
-                &url,
-                tmp_dir,
-                &file.file_name,
-                config.min_speed,
-            )
-            .await?
+            aria2c::download(&config.aria2c, &url, tmp_dir, &file.file_name, min_speed).await?
         }
     };
 
@@ -201,7 +210,31 @@ impl DownloadOrchestrator {
             "fetch cycle planned"
         );
 
-        for plan in &decision.plans {
+        let mut slow_peers: HashSet<&str> = HashSet::new();
+        for (i, plan) in decision.plans.iter().enumerate() {
+            let min_speed = match policy::plan_attempt(
+                &decision.plans,
+                i,
+                &slow_peers,
+                self.config.min_speed,
+            ) {
+                PlanAttempt::Skip => {
+                    info!(
+                        peer = plan.peer_addr,
+                        "skipping plan: peer was below min_speed this cycle"
+                    );
+                    continue;
+                }
+                PlanAttempt::Run { min_speed } => {
+                    if min_speed < self.config.min_speed {
+                        info!(
+                            peer = plan.peer_addr,
+                            "last candidate peer: min_speed not enforced"
+                        );
+                    }
+                    min_speed
+                }
+            };
             if plan.incremental_only {
                 info!(
                     peer = plan.peer_addr,
@@ -223,12 +256,16 @@ impl DownloadOrchestrator {
                     decision.best_remote_slot,
                     decision.local_bootstrap,
                     reason,
+                    min_speed,
                 )
                 .await
             {
                 Ok(true) => return Ok(FetchOutcome::Downloaded),
                 Ok(false) => continue,
                 Err(e) => {
+                    if e.downcast_ref::<SlowTransfer>().is_some() {
+                        slow_peers.insert(plan.peer_addr.as_str());
+                    }
                     warn!(peer = plan.peer_addr, error = %e, "download failed, trying next plan");
                 }
             }
@@ -265,6 +302,7 @@ impl DownloadOrchestrator {
         best_remote_slot: u64,
         local_bootstrap: u64,
         reason: FetchReason,
+        min_speed: u64,
     ) -> Result<bool> {
         if !self.plan_needs_download(plan).await {
             info!("snapshot plan already satisfied locally");
@@ -273,7 +311,7 @@ impl DownloadOrchestrator {
 
         let start = Instant::now();
         match self
-            .download_plan(plan, best_remote_slot, local_bootstrap)
+            .download_plan(plan, best_remote_slot, local_bootstrap, min_speed)
             .await
         {
             Ok(bytes) if bytes > 0 => {
@@ -313,6 +351,7 @@ impl DownloadOrchestrator {
         plan: &DownloadPlan,
         best_remote_slot: u64,
         local_bootstrap: u64,
+        min_speed: u64,
     ) -> Result<u64> {
         let snap_dir = self.index.dir();
         if plan.incremental_only && !snapshot::file_complete(snap_dir, &plan.full.file_name).await {
@@ -349,13 +388,19 @@ impl DownloadOrchestrator {
 
         let (full_dl, inc_dl) = match (need_full, need_inc) {
             (true, true) => {
-                let full_fut =
-                    download_one_file(&self.config, &plan.peer_addr, &plan.full, &tmp_dir);
+                let full_fut = download_one_file(
+                    &self.config,
+                    &plan.peer_addr,
+                    &plan.full,
+                    &tmp_dir,
+                    min_speed,
+                );
                 let inc_fut = download_one_file(
                     &self.config,
                     &plan.peer_addr,
                     plan.incremental.as_ref().unwrap(),
                     &tmp_dir,
+                    min_speed,
                 );
                 let (full_result, inc_result) = tokio::join!(full_fut, inc_fut);
                 let full_dl = full_result?;
@@ -369,8 +414,14 @@ impl DownloadOrchestrator {
                 (Some(full_dl), inc_dl)
             }
             (true, false) => {
-                let full_dl =
-                    download_one_file(&self.config, &plan.peer_addr, &plan.full, &tmp_dir).await?;
+                let full_dl = download_one_file(
+                    &self.config,
+                    &plan.peer_addr,
+                    &plan.full,
+                    &tmp_dir,
+                    min_speed,
+                )
+                .await?;
                 (Some(full_dl), None)
             }
             (false, true) => {
@@ -379,6 +430,7 @@ impl DownloadOrchestrator {
                     &plan.peer_addr,
                     plan.incremental.as_ref().unwrap(),
                     &tmp_dir,
+                    min_speed,
                 )
                 .await
                 {
@@ -402,6 +454,7 @@ impl DownloadOrchestrator {
                     local_bootstrap,
                     &tmp_dir,
                     &plan.peer_addr,
+                    min_speed,
                 )
                 .await
             }
@@ -466,6 +519,7 @@ impl DownloadOrchestrator {
         min_slot: u64,
         tmp_dir: &Path,
         original_peer: &str,
+        min_speed: u64,
     ) -> Option<DownloadedFile> {
         let all_peers = self.peer_mgr.list_peers().await;
         let mut addrs: Vec<String> = Vec::with_capacity(all_peers.len());
@@ -496,7 +550,7 @@ impl DownloadOrchestrator {
                 "retrying incremental download"
             );
 
-            match download_one_file(&self.config, addr, &inc, tmp_dir).await {
+            match download_one_file(&self.config, addr, &inc, tmp_dir, min_speed).await {
                 Ok(dl) => return Some(dl),
                 Err(e) => {
                     warn!(peer = %addr, error = %e, "incremental retry failed");

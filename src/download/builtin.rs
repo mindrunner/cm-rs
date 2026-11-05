@@ -9,9 +9,10 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
-use super::DownloadResult;
+use super::{DownloadResult, SlowTransfer};
 
 const MIN_SPEED_WINDOW: Duration = Duration::from_secs(60);
+const ABORT_POLL: Duration = Duration::from_secs(1);
 
 /// Download a file using parallel HTTP range requests.
 ///
@@ -137,24 +138,23 @@ fn spawn_progress_watchdog(
                 "downloading"
             );
 
-            if min_speed > 0 {
-                if (instant_speed as u64) < min_speed {
-                    let since = *slow_since.get_or_insert(now);
-                    let slow_dur = now.duration_since(since);
-                    if slow_dur >= MIN_SPEED_WINDOW {
-                        warn!(
-                            file = file_name,
-                            instant_speed_mbps = format!("{:.1}", instant_speed / 1_048_576.0),
-                            min_speed_mbps = format!("{:.1}", min_speed as f64 / 1_048_576.0),
-                            slow_for_secs = slow_dur.as_secs(),
-                            "aborting download: speed below minimum for too long"
-                        );
-                        abort.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                } else {
-                    slow_since = None;
+            // min_speed 0 still aborts a transfer that moves no bytes at all.
+            if (instant_speed as u64) < min_speed.max(1) {
+                let since = *slow_since.get_or_insert(now);
+                let slow_dur = now.duration_since(since);
+                if slow_dur >= MIN_SPEED_WINDOW {
+                    warn!(
+                        file = file_name,
+                        instant_speed_mbps = format!("{:.1}", instant_speed / 1_048_576.0),
+                        min_speed_mbps = format!("{:.1}", min_speed as f64 / 1_048_576.0),
+                        slow_for_secs = slow_dur.as_secs(),
+                        "aborting download: speed below minimum for too long"
+                    );
+                    abort.store(true, Ordering::Relaxed);
+                    break;
                 }
+            } else {
+                slow_since = None;
             }
 
             if bytes >= total_size {
@@ -239,6 +239,22 @@ async fn parallel_range_download(
     })
 }
 
+/// Next body chunk, or `SlowTransfer` once the watchdog sets `abort`. Polls
+/// the flag while waiting so a stalled connection is abandoned too.
+async fn next_chunk<S, T>(stream: &mut S, abort: &AtomicBool) -> Result<Option<T>>
+where
+    S: futures_util::Stream<Item = reqwest::Result<T>> + Unpin,
+{
+    loop {
+        if abort.load(Ordering::Relaxed) {
+            return Err(SlowTransfer.into());
+        }
+        if let Ok(next) = tokio::time::timeout(ABORT_POLL, stream.next()).await {
+            return Ok(next.transpose()?);
+        }
+    }
+}
+
 async fn download_range_streaming(
     client: &reqwest::Client,
     url: &str,
@@ -264,11 +280,7 @@ async fn download_range_streaming(
     let mut stream = resp.bytes_stream();
     let mut written = 0u64;
 
-    while let Some(chunk) = stream.next().await {
-        if abort.load(Ordering::Relaxed) {
-            anyhow::bail!("download aborted: speed below minimum threshold");
-        }
-        let chunk = chunk?;
+    while let Some(chunk) = next_chunk(&mut stream, &abort).await? {
         file.write_all(&chunk).await?;
         let len = chunk.len() as u64;
         written += len;
@@ -319,11 +331,7 @@ async fn sequential_download(
     let mut total = 0u64;
     let mut hasher = Sha256::new();
 
-    while let Some(chunk) = stream.next().await {
-        if abort.load(Ordering::Relaxed) {
-            anyhow::bail!("download aborted: speed below minimum threshold");
-        }
-        let chunk = chunk?;
+    while let Some(chunk) = next_chunk(&mut stream, &abort).await? {
         hasher.update(&chunk);
         file.write_all(&chunk).await?;
         let len = chunk.len() as u64;
@@ -340,4 +348,25 @@ async fn sequential_download(
         bytes: total,
         sha256: hash,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn next_chunk_abandons_a_stalled_stream_on_abort() {
+        let mut stream = futures_util::stream::pending::<reqwest::Result<Vec<u8>>>();
+        let abort = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&abort);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            flag.store(true, Ordering::Relaxed);
+        });
+
+        let res = tokio::time::timeout(Duration::from_secs(5), next_chunk(&mut stream, &abort))
+            .await
+            .expect("stalled stream was never abandoned");
+        assert!(res.unwrap_err().downcast_ref::<SlowTransfer>().is_some());
+    }
 }
