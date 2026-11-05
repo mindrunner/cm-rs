@@ -64,6 +64,9 @@ and offline-too-long recovery, plus cheap incremental top-ups.
   `min_slots_behind` fresh, not incremental-interval fresh.
 - `cm fetch --force` bypasses the gate and floor (treats `min_slots_behind`
   as 0) for manual recovery.
+- **Fetch outcome** — what a cycle achieved: `Downloaded`, `NotNeeded`,
+  `NoPeers`, or `Unresolved(reason)`. `cm fetch` fails on `NoPeers` and on an
+  unresolved `bootstrap` or `behind`; an unresolved `topup` is not a failure.
 
 ## Download plan
 

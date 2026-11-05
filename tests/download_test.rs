@@ -1,6 +1,6 @@
 use cm::config::DownloadConfig;
 use cm::config::{PeersConfig, StaticPeersConfig};
-use cm::download::DownloadOrchestrator;
+use cm::download::{DownloadOrchestrator, FetchOutcome, FetchReason};
 use cm::index::SnapshotIndex;
 use cm::metrics::Metrics;
 use cm::peer::PeerManager;
@@ -71,8 +71,8 @@ async fn full_download_cycle() {
     let orchestrator =
         DownloadOrchestrator::new(download_config, local_index.clone(), peer_mgr, metrics);
 
-    let downloaded = orchestrator.fetch_if_needed().await.unwrap();
-    assert!(downloaded);
+    let outcome = orchestrator.fetch_if_needed().await.unwrap();
+    assert_eq!(outcome, FetchOutcome::Downloaded);
 
     // Verify file landed in local dir
     let local_snap = local_dir.path().join("snapshot-5000-abcdef.tar.zst");
@@ -123,8 +123,8 @@ async fn download_with_incremental() {
     let orchestrator =
         DownloadOrchestrator::new(download_config, local_index.clone(), peer_mgr, metrics);
 
-    let downloaded = orchestrator.fetch_if_needed().await.unwrap();
-    assert!(downloaded);
+    let outcome = orchestrator.fetch_if_needed().await.unwrap();
+    assert_eq!(outcome, FetchOutcome::Downloaded);
 
     // Both full and incremental should be present
     assert!(local_dir.path().join("snapshot-1000-full.tar.zst").exists());
@@ -172,8 +172,8 @@ async fn no_download_when_up_to_date() {
 
     let orchestrator = DownloadOrchestrator::new(download_config, local_index, peer_mgr, metrics);
 
-    let downloaded = orchestrator.fetch_if_needed().await.unwrap();
-    assert!(!downloaded);
+    let outcome = orchestrator.fetch_if_needed().await.unwrap();
+    assert_eq!(outcome, FetchOutcome::NotNeeded);
 }
 
 /// Regression: a node marginally behind must never download a full snapshot —
@@ -223,8 +223,12 @@ async fn no_full_download_when_marginally_behind() {
     let orchestrator =
         DownloadOrchestrator::new(download_config, local_index.clone(), peer_mgr, metrics);
 
-    let downloaded = orchestrator.fetch_if_needed().await.unwrap();
-    assert!(downloaded, "incremental top-up should still happen");
+    let outcome = orchestrator.fetch_if_needed().await.unwrap();
+    assert_eq!(
+        outcome,
+        FetchOutcome::Downloaded,
+        "incremental top-up should still happen"
+    );
 
     // The incremental landed; the newer full must NOT have been downloaded.
     assert!(
@@ -307,8 +311,12 @@ async fn reuses_staged_file_without_network() {
         metrics,
     );
 
-    let downloaded = orchestrator.fetch_if_needed().await.unwrap();
-    assert!(downloaded, "staged file should be admitted without network");
+    let outcome = orchestrator.fetch_if_needed().await.unwrap();
+    assert_eq!(
+        outcome,
+        FetchOutcome::Downloaded,
+        "staged file should be admitted without network"
+    );
     assert!(local_dir.path().join("snapshot-7000-xyz.tar.zst").exists());
     let content = std::fs::read(local_dir.path().join("snapshot-7000-xyz.tar.zst")).unwrap();
     assert_eq!(content, snap_data);
@@ -362,10 +370,82 @@ async fn download_verifies_checksum() {
     let orchestrator =
         DownloadOrchestrator::new(download_config, local_index.clone(), peer_mgr, metrics);
 
-    let downloaded = orchestrator.fetch_if_needed().await.unwrap();
-    assert!(downloaded);
+    let outcome = orchestrator.fetch_if_needed().await.unwrap();
+    assert_eq!(outcome, FetchOutcome::Downloaded);
 
     // After download, local index should also have the same hash
     let local_snap = local_index.get("snapshot-8000-chk.tar.zst").await.unwrap();
     assert_eq!(local_snap.sha256, snaps[0].sha256);
+}
+
+async fn poll_static_peer(peer_addr: &str, metrics: &Metrics) -> PeerManager {
+    let config = PeersConfig {
+        poll_interval: std::time::Duration::from_secs(1),
+        static_peers: Some(StaticPeersConfig {
+            hosts: vec![peer_addr.to_string()],
+        }),
+        ..Default::default()
+    };
+    let peer_mgr = PeerManager::new(config, metrics.clone());
+    let mgr = peer_mgr.clone();
+    let poll = tokio::spawn(async move { mgr.poll_loop().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    poll.abort();
+    peer_mgr
+}
+
+/// Regression (wt-2, 2026-10-06): a node far behind whose every full plan
+/// fails must report the cycle unresolved, not "no download needed".
+#[tokio::test]
+async fn behind_with_every_plan_failing_is_unresolved() {
+    let peer_dir = tempfile::tempdir().unwrap();
+    touch(peer_dir.path(), "snapshot-100-hash.tar.zst", &[0u8; 64]);
+    touch(peer_dir.path(), "snapshot-5000-bad.tar.zst", &[5u8; 512]);
+    touch(
+        peer_dir.path(),
+        "snapshot-5000-bad.tar.zst.sha256",
+        "0".repeat(64).as_bytes(),
+    );
+    let peer_addr = start_server(peer_dir.path()).await;
+
+    let local_dir = tempfile::tempdir().unwrap();
+    touch(local_dir.path(), "snapshot-100-hash.tar.zst", &[0u8; 64]);
+
+    let metrics = Metrics::new(None);
+    let peer_mgr = poll_static_peer(&peer_addr, &metrics).await;
+    let local_index = SnapshotIndex::new(local_dir.path().to_path_buf());
+    local_index.scan().await.unwrap();
+
+    let download_config = DownloadConfig {
+        min_slots_behind: 2500,
+        ..Default::default()
+    };
+    let orchestrator =
+        DownloadOrchestrator::new(download_config, local_index.clone(), peer_mgr, metrics);
+
+    let outcome = orchestrator.fetch_if_needed().await.unwrap();
+    assert_eq!(
+        outcome,
+        FetchOutcome::Unresolved(FetchReason::Behind { diff: 4900 })
+    );
+    assert_eq!(local_index.highest_slot().await, 100);
+}
+
+/// No local snapshot and nothing on offer is a failed bootstrap, not "up to date".
+#[tokio::test]
+async fn empty_local_and_empty_peer_is_unresolved_bootstrap() {
+    let peer_dir = tempfile::tempdir().unwrap();
+    let peer_addr = start_server(peer_dir.path()).await;
+    let local_dir = tempfile::tempdir().unwrap();
+
+    let metrics = Metrics::new(None);
+    let peer_mgr = poll_static_peer(&peer_addr, &metrics).await;
+    let local_index = SnapshotIndex::new(local_dir.path().to_path_buf());
+    local_index.scan().await.unwrap();
+
+    let orchestrator =
+        DownloadOrchestrator::new(DownloadConfig::default(), local_index, peer_mgr, metrics);
+
+    let outcome = orchestrator.fetch_if_needed().await.unwrap();
+    assert_eq!(outcome, FetchOutcome::Unresolved(FetchReason::Bootstrap));
 }

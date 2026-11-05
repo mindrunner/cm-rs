@@ -1,7 +1,7 @@
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::download::{DownloadOrchestrator, agave_bootstrap_slot};
+use crate::download::{DownloadOrchestrator, FetchOutcome, FetchReason, agave_bootstrap_slot};
 use crate::index::SnapshotIndex;
 use crate::metrics::{Metrics, TypeLabel};
 use crate::peer::PeerManager;
@@ -73,11 +73,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         loop {
             tokio::time::sleep(interval).await;
             match orchestrator.fetch_if_needed().await {
-                Ok(true) => {
+                Ok(FetchOutcome::Downloaded) => {
                     update_local_metrics(&index, &metrics).await;
                     info!("auto-fetch: downloaded new snapshot");
                 }
-                Ok(false) => {}
+                Ok(_) => {}
                 Err(e) => {
                     warn!(error = %e, "auto-fetch failed");
                 }
@@ -175,10 +175,19 @@ pub async fn fetch_once(mut config: Config, force: bool) -> anyhow::Result<()> {
     let orchestrator =
         DownloadOrchestrator::new(config.download.clone(), index.clone(), peer_mgr, metrics);
 
-    match orchestrator.fetch_if_needed().await {
-        Ok(true) => info!("fetch complete: downloaded new snapshot"),
-        Ok(false) => info!("fetch complete: no download needed"),
-        Err(e) => return Err(e),
+    match orchestrator.fetch_if_needed().await? {
+        FetchOutcome::Downloaded => info!("fetch complete: downloaded new snapshot"),
+        FetchOutcome::NotNeeded => info!("fetch complete: no download needed"),
+        FetchOutcome::Unresolved(FetchReason::TopUp) => {
+            info!("fetch complete: no top-up landed, local bootstrap within min_slots_behind")
+        }
+        FetchOutcome::NoPeers => anyhow::bail!("no peers available, cannot fetch"),
+        FetchOutcome::Unresolved(FetchReason::Bootstrap) => {
+            anyhow::bail!("fetch failed: no usable local snapshot and no download plan succeeded")
+        }
+        FetchOutcome::Unresolved(FetchReason::Behind { diff }) => anyhow::bail!(
+            "fetch failed: local bootstrap is {diff} slots behind peers and no download plan succeeded"
+        ),
     }
     Ok(())
 }

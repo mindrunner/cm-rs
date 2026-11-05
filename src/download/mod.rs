@@ -26,6 +26,19 @@ pub struct DownloadResult {
     pub sha256: String,
 }
 
+/// What one fetch cycle achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchOutcome {
+    /// A snapshot was downloaded and admitted.
+    Downloaded,
+    /// No peer is far enough ahead of the local bootstrap to justify a download.
+    NotNeeded,
+    /// No ranked peer to plan against.
+    NoPeers,
+    /// The cycle wanted a snapshot for this reason and none landed.
+    Unresolved(FetchReason),
+}
+
 /// A successfully downloaded file in the staging directory.
 struct DownloadedFile {
     file_name: String,
@@ -132,38 +145,52 @@ impl DownloadOrchestrator {
     }
 
     /// Check if we need a new snapshot and download it if so.
-    /// Returns true if a download was performed.
-    pub async fn fetch_if_needed(&self) -> Result<bool> {
+    pub async fn fetch_if_needed(&self) -> Result<FetchOutcome> {
         let local_snaps = self.index.list().await;
         let ranked = self.peer_mgr.ranked_peers().await;
         if ranked.is_empty() {
             info!("no peers available, skipping fetch");
-            return Ok(false);
+            return Ok(FetchOutcome::NoPeers);
         }
 
         let decision = policy::decide(&local_snaps, &ranked, self.config.min_slots_behind);
 
         let Some(reason) = decision.reason else {
-            match decision.gate {
-                FullFetchGate::UpToDate => info!(
-                    local_bootstrap = decision.local_bootstrap,
+            if decision.local_bootstrap == 0 {
+                warn!(
                     best_remote_slot = decision.best_remote_slot,
-                    "local bootstrap is up to date with peers"
-                ),
-                FullFetchGate::NotFarEnoughBehind { diff } => info!(
-                    local_bootstrap = decision.local_bootstrap,
-                    best_remote_slot = decision.best_remote_slot,
-                    diff,
-                    min = self.config.min_slots_behind,
-                    "not far enough behind for new full snapshot"
-                ),
-                FullFetchGate::Seek { .. } => info!(
-                    local_bootstrap = decision.local_bootstrap,
-                    best_remote_slot = decision.best_remote_slot,
-                    "behind, but no worthwhile plan from peers; waiting"
-                ),
+                    "no local snapshot and no peer offers one"
+                );
+                return Ok(FetchOutcome::Unresolved(FetchReason::Bootstrap));
             }
-            return Ok(false);
+            return Ok(match decision.gate {
+                FullFetchGate::UpToDate => {
+                    info!(
+                        local_bootstrap = decision.local_bootstrap,
+                        best_remote_slot = decision.best_remote_slot,
+                        "local bootstrap is up to date with peers"
+                    );
+                    FetchOutcome::NotNeeded
+                }
+                FullFetchGate::NotFarEnoughBehind { diff } => {
+                    info!(
+                        local_bootstrap = decision.local_bootstrap,
+                        best_remote_slot = decision.best_remote_slot,
+                        diff,
+                        min = self.config.min_slots_behind,
+                        "not far enough behind for new full snapshot"
+                    );
+                    FetchOutcome::NotNeeded
+                }
+                FullFetchGate::Seek { diff } => {
+                    warn!(
+                        local_bootstrap = decision.local_bootstrap,
+                        best_remote_slot = decision.best_remote_slot,
+                        "behind, but no worthwhile plan from peers; waiting"
+                    );
+                    FetchOutcome::Unresolved(FetchReason::Behind { diff })
+                }
+            });
         };
 
         info!(
@@ -199,7 +226,7 @@ impl DownloadOrchestrator {
                 )
                 .await
             {
-                Ok(true) => return Ok(true),
+                Ok(true) => return Ok(FetchOutcome::Downloaded),
                 Ok(false) => continue,
                 Err(e) => {
                     warn!(peer = plan.peer_addr, error = %e, "download failed, trying next plan");
@@ -207,11 +234,13 @@ impl DownloadOrchestrator {
             }
         }
 
-        info!(
+        warn!(
             reason = reason.as_str(),
+            local_bootstrap = decision.local_bootstrap,
+            best_remote_slot = decision.best_remote_slot,
             "no download plan succeeded this cycle"
         );
-        Ok(false)
+        Ok(FetchOutcome::Unresolved(reason))
     }
 
     async fn plan_needs_download(&self, plan: &DownloadPlan) -> bool {
