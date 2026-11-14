@@ -74,7 +74,9 @@ hosts = [
 # max_incremental_snapshots = 4
 
 # Minimum download speed in bytes/sec. If speed stays below this threshold
-# for 60 continuous seconds the download is aborted. 0 = disabled.
+# for 60 continuous seconds the download is aborted and the peer is skipped
+# for the rest of the cycle. Not enforced on the last candidate peer.
+# 0 = only abort a transfer that moves no bytes for 60 seconds.
 # Default: 0
 # min_speed = 50000000
 
