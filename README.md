@@ -192,7 +192,7 @@ is computed on admit), which is why this tier is opt-in.
 | `rpc_urls`           | string[] | `["https://api.mainnet-beta.solana.com"]`        | RPC endpoints for `getClusterNodes` node discovery and `getSlot` tip |
 | `min_peer_bandwidth` | u64      | `10000000`                                       | Peers measured below this (bytes/sec) count as slow; if **all** measured peers are slow, external is tried first (0 = off) |
 | `max_slot_lag`       | u64      | `1300`                                           | Reject external snapshots this far behind the tip  |
-| `max_candidates`     | usize    | `5`                                              | Speed-test only the N lowest-latency candidates    |
+| `max_candidates`     | usize    | `5`                                              | Speed-test the N lowest-latency discovered nodes (mirrors are always tested) |
 | `probe_concurrency`  | usize    | `16`                                             | Concurrent probes                                  |
 | `speed_test_bytes`   | u64      | `16777216`                                       | Bytes downloaded per candidate to measure speed    |
 | `min_source_speed`   | u64      | `0`                                              | Drop candidates below this (bytes/sec); 0 = accept any |
