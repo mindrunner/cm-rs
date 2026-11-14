@@ -31,27 +31,17 @@ pub struct PeerStats {
     pub last_seen: Option<u64>,
     pub latency_ms: Option<f64>,
     pub bandwidth_bps: Option<f64>,
+    /// Unix seconds of the last bandwidth measurement; slow marks expire
+    /// after [`crate::download::policy::SLOW_MARK_TTL_SECS`].
+    #[serde(default)]
+    pub bandwidth_at: Option<u64>,
     pub errors: u64,
     pub score: f64,
 }
 
 impl PeerInfo {
     pub fn highest_slot(&self) -> u64 {
-        let full_slots: std::collections::HashSet<u64> = self
-            .snapshots
-            .iter()
-            .filter(|s| s.is_full())
-            .map(|s| s.slot)
-            .collect();
-        self.snapshots
-            .iter()
-            .filter(|s| match s.base_slot {
-                Some(base) => full_slots.contains(&base),
-                None => true,
-            })
-            .map(|s| s.slot)
-            .max()
-            .unwrap_or(0)
+        crate::snapshot::highest_usable_slot(&self.snapshots)
     }
 }
 
@@ -125,6 +115,60 @@ impl PeerManager {
         Ok((snapshots, latency_ms))
     }
 
+    /// Run one discovery + poll cycle over all peers. Peers are polled
+    /// concurrently, so the wall-clock bound is one request timeout (5s)
+    /// regardless of how many peers are down.
+    pub async fn poll_once(&self) {
+        let addrs = self.discover_peers().await;
+        debug!(peer_count = addrs.len(), "discovered peers");
+
+        let results = futures_util::future::join_all(
+            addrs
+                .iter()
+                .map(|addr| async move { (addr.clone(), self.poll_peer(addr).await) }),
+        )
+        .await;
+
+        for (addr, result) in results {
+            let addr = &addr;
+            match result {
+                Ok((snapshots, latency_ms)) => {
+                    let mut peers = self.peers.write().await;
+                    let entry = peers.entry(addr.clone()).or_insert_with(|| PeerInfo {
+                        addr: addr.clone(),
+                        snapshots: Vec::new(),
+                        stats: PeerStats::default(),
+                    });
+                    entry.snapshots = snapshots;
+                    entry.stats.last_seen = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    );
+                    entry.stats.latency_ms = Some(latency_ms);
+                }
+                Err(e) => {
+                    debug!(peer = addr, error = %e, "poll failed");
+                    let mut peers = self.peers.write().await;
+                    let entry = peers.entry(addr.clone()).or_insert_with(|| PeerInfo {
+                        addr: addr.clone(),
+                        snapshots: Vec::new(),
+                        stats: PeerStats::default(),
+                    });
+                    entry.stats.errors += 1;
+                    self.metrics
+                        .peer_errors
+                        .get_or_create(&metrics::peer_label(addr))
+                        .inc();
+                }
+            }
+        }
+
+        let peer_count = self.peers.read().await.len();
+        self.metrics.peers_total.set(peer_count as i64);
+    }
+
     pub async fn poll_loop(&self) {
         let interval = self.config.poll_interval;
         info!(
@@ -133,49 +177,19 @@ impl PeerManager {
         );
 
         loop {
-            let addrs = self.discover_peers().await;
-            debug!(peer_count = addrs.len(), "discovered peers");
-
-            for addr in &addrs {
-                match self.poll_peer(addr).await {
-                    Ok((snapshots, latency_ms)) => {
-                        let mut peers = self.peers.write().await;
-                        let entry = peers.entry(addr.clone()).or_insert_with(|| PeerInfo {
-                            addr: addr.clone(),
-                            snapshots: Vec::new(),
-                            stats: PeerStats::default(),
-                        });
-                        entry.snapshots = snapshots;
-                        entry.stats.last_seen = Some(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
-                        );
-                        entry.stats.latency_ms = Some(latency_ms);
-                    }
-                    Err(e) => {
-                        debug!(peer = addr, error = %e, "poll failed");
-                        let mut peers = self.peers.write().await;
-                        let entry = peers.entry(addr.clone()).or_insert_with(|| PeerInfo {
-                            addr: addr.clone(),
-                            snapshots: Vec::new(),
-                            stats: PeerStats::default(),
-                        });
-                        entry.stats.errors += 1;
-                        self.metrics
-                            .peer_errors
-                            .get_or_create(&metrics::peer_label(addr))
-                            .inc();
-                    }
-                }
-            }
-
-            let peer_count = self.peers.read().await.len();
-            self.metrics.peers_total.set(peer_count as i64);
-
+            self.poll_once().await;
             tokio::time::sleep(interval).await;
         }
+    }
+
+    /// Seed the peer map from an already-populated peer list (e.g. the local
+    /// daemon's warm state), keeping its latency/bandwidth history.
+    pub async fn hydrate(&self, peers: Vec<PeerInfo>) {
+        let mut map = self.peers.write().await;
+        for peer in peers {
+            map.insert(peer.addr.clone(), peer);
+        }
+        self.metrics.peers_total.set(map.len() as i64);
     }
 
     /// Get peers ranked by composite score (lower is better).
@@ -210,6 +224,12 @@ impl PeerManager {
         let mut peers = self.peers.write().await;
         if let Some(peer) = peers.get_mut(addr) {
             peer.stats.bandwidth_bps = Some(bytes_per_sec);
+            peer.stats.bandwidth_at = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
         }
     }
 }

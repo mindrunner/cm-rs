@@ -33,6 +33,36 @@ fn default_upload_interval() -> Duration {
 fn default_aria2c_binary() -> String {
     "/usr/bin/aria2c".into()
 }
+fn default_fallback_mirrors() -> Vec<String> {
+    vec!["https://snapshots.avorio.network/mainnet-beta".into()]
+}
+fn default_fallback_rpc_urls() -> Vec<String> {
+    vec!["https://api.mainnet-beta.solana.com".into()]
+}
+fn default_min_peer_bandwidth() -> u64 {
+    10_000_000 // 10 MB/s
+}
+fn default_max_slot_lag() -> u64 {
+    1300
+}
+fn default_max_candidates() -> usize {
+    5
+}
+fn default_probe_concurrency() -> usize {
+    16
+}
+fn default_speed_test_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+fn default_probe_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+fn default_speed_test_timeout() -> Duration {
+    Duration::from_secs(15)
+}
+fn default_fallback_cooldown() -> Duration {
+    Duration::from_secs(600)
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -45,6 +75,8 @@ pub struct Config {
     pub s3: S3Config,
     #[serde(default)]
     pub auto: AutoConfig,
+    #[serde(default)]
+    pub fallback: FallbackConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -163,6 +195,69 @@ impl Default for Aria2cConfig {
     }
 }
 
+/// External snapshot sources used when no (or only slow) cm peers can serve.
+/// Sources must follow the agave RPC snapshot convention: `{base}/snapshot.tar.bz2`
+/// redirects to the concrete `snapshot-SLOT-HASH.tar.zst`, which is then
+/// fetched at `{base}/{file_name}`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct FallbackConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Static mirror base URLs.
+    #[serde(default = "default_fallback_mirrors")]
+    pub mirrors: Vec<String>,
+    /// Solana RPC endpoints used to discover snapshot-serving cluster nodes
+    /// (`getClusterNodes`) and the cluster tip (`getSlot`).
+    #[serde(default = "default_fallback_rpc_urls")]
+    pub rpc_urls: Vec<String>,
+    /// Peers whose measured download bandwidth (bytes/sec) is below this count
+    /// as slow; if every measured peer is slow, external sources are tried
+    /// first. 0 disables the slow-peer trigger.
+    #[serde(default = "default_min_peer_bandwidth")]
+    pub min_peer_bandwidth: u64,
+    /// Reject external snapshots more than this many slots behind the cluster tip.
+    #[serde(default = "default_max_slot_lag")]
+    pub max_slot_lag: u64,
+    /// Speed-test only the N lowest-latency candidates.
+    #[serde(default = "default_max_candidates")]
+    pub max_candidates: usize,
+    #[serde(default = "default_probe_concurrency")]
+    pub probe_concurrency: usize,
+    /// Bytes to download per candidate when measuring speed.
+    #[serde(default = "default_speed_test_bytes")]
+    pub speed_test_bytes: u64,
+    /// Drop candidates measuring below this (bytes/sec). 0 accepts any.
+    #[serde(default)]
+    pub min_source_speed: u64,
+    #[serde(default = "default_probe_timeout", with = "humantime_serde")]
+    pub probe_timeout: Duration,
+    #[serde(default = "default_speed_test_timeout", with = "humantime_serde")]
+    pub speed_test_timeout: Duration,
+    /// Minimum gap between external probe rounds; probe results are reused
+    /// within this window.
+    #[serde(default = "default_fallback_cooldown", with = "humantime_serde")]
+    pub cooldown: Duration,
+}
+
+impl Default for FallbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mirrors: default_fallback_mirrors(),
+            rpc_urls: default_fallback_rpc_urls(),
+            min_peer_bandwidth: default_min_peer_bandwidth(),
+            max_slot_lag: default_max_slot_lag(),
+            max_candidates: default_max_candidates(),
+            probe_concurrency: default_probe_concurrency(),
+            speed_test_bytes: default_speed_test_bytes(),
+            min_source_speed: 0,
+            probe_timeout: default_probe_timeout(),
+            speed_test_timeout: default_speed_test_timeout(),
+            cooldown: default_fallback_cooldown(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct S3Config {
     #[serde(default)]
@@ -250,6 +345,62 @@ mod tests {
         assert!(cfg.auto.enabled);
         assert_eq!(cfg.auto.check_interval, Duration::from_secs(30));
         assert!(!cfg.s3.enabled);
+        assert!(!cfg.fallback.enabled);
+    }
+
+    #[test]
+    fn fallback_defaults() {
+        let cfg = Config::from_str(
+            r#"
+            [node]
+            snapshot_dir = "/tmp"
+
+            [fallback]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+        let fb = cfg.fallback;
+        assert!(fb.enabled);
+        assert_eq!(
+            fb.mirrors,
+            vec!["https://snapshots.avorio.network/mainnet-beta"]
+        );
+        assert_eq!(fb.rpc_urls, vec!["https://api.mainnet-beta.solana.com"]);
+        assert_eq!(fb.min_peer_bandwidth, 10_000_000);
+        assert_eq!(fb.max_slot_lag, 1300);
+        assert_eq!(fb.max_candidates, 5);
+        assert_eq!(fb.probe_concurrency, 16);
+        assert_eq!(fb.speed_test_bytes, 16 * 1024 * 1024);
+        assert_eq!(fb.min_source_speed, 0);
+        assert_eq!(fb.probe_timeout, Duration::from_secs(5));
+        assert_eq!(fb.speed_test_timeout, Duration::from_secs(15));
+        assert_eq!(fb.cooldown, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn fallback_overrides() {
+        let cfg = Config::from_str(
+            r#"
+            [node]
+            snapshot_dir = "/tmp"
+
+            [fallback]
+            enabled = true
+            mirrors = ["https://mirror.example.com/snaps"]
+            rpc_urls = []
+            min_peer_bandwidth = 0
+            max_slot_lag = 500
+            cooldown = "1m"
+            "#,
+        )
+        .unwrap();
+        let fb = cfg.fallback;
+        assert_eq!(fb.mirrors, vec!["https://mirror.example.com/snaps"]);
+        assert!(fb.rpc_urls.is_empty());
+        assert_eq!(fb.min_peer_bandwidth, 0);
+        assert_eq!(fb.max_slot_lag, 500);
+        assert_eq!(fb.cooldown, Duration::from_secs(60));
     }
 
     #[test]

@@ -80,6 +80,25 @@ pub fn is_archive_name(name: &str) -> bool {
     name.ends_with(ARCHIVE_SUFFIX)
 }
 
+/// Highest usable slot in a snapshot inventory: incrementals only count when
+/// their base full snapshot is present.
+pub fn highest_usable_slot(snapshots: &[SnapshotInfo]) -> u64 {
+    let full_slots: std::collections::HashSet<u64> = snapshots
+        .iter()
+        .filter(|s| s.is_full())
+        .map(|s| s.slot)
+        .collect();
+    snapshots
+        .iter()
+        .filter(|s| match s.base_slot {
+            Some(base) => full_slots.contains(&base),
+            None => true,
+        })
+        .map(|s| s.slot)
+        .max()
+        .unwrap_or(0)
+}
+
 /// The slot a snapshot filename boots to (the incremental slot for incrementals).
 pub fn primary_slot(file_name: &str) -> Option<u64> {
     SnapshotInfo::from_filename(file_name, 0, 0).map(|i| i.slot)

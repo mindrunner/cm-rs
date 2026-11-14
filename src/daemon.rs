@@ -2,9 +2,10 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::download::{DownloadOrchestrator, FetchOutcome, FetchReason, agave_bootstrap_slot};
+use crate::fallback::FallbackManager;
 use crate::index::SnapshotIndex;
 use crate::metrics::{Metrics, TypeLabel};
-use crate::peer::PeerManager;
+use crate::peer::{PeerInfo, PeerManager};
 use crate::s3::S3Uploader;
 use crate::server::{self, AppState};
 
@@ -25,7 +26,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         index.clone(),
         peer_mgr.clone(),
         metrics.clone(),
-    );
+    )
+    .with_fallback(fallback_manager(&config));
 
     let state = AppState {
         index: index.clone(),
@@ -139,8 +141,39 @@ async fn clean_staging(index: &SnapshotIndex) {
     }
 }
 
-/// One-shot fetch: discover peers, poll them once, find best snapshot, download, exit.
-/// With `force`, the freshness gate is bypassed (`min_slots_behind` treated as 0).
+/// The configured external fallback tier, when enabled.
+fn fallback_manager(config: &Config) -> Option<FallbackManager> {
+    config
+        .fallback
+        .enabled
+        .then(|| FallbackManager::new(config.fallback.clone()))
+}
+
+/// Base URL to reach the local daemon's API on the loopback interface.
+fn local_daemon_url(listen_addr: &str) -> String {
+    let port = listen_addr.rsplit(':').next().unwrap_or("13080");
+    let host = listen_addr
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .filter(|h| !h.is_empty() && *h != "0.0.0.0" && *h != "[::]" && *h != "::")
+        .unwrap_or("127.0.0.1");
+    format!("http://{}:{}", host, port)
+}
+
+/// Peer state from a locally running daemon, if one answers quickly.
+async fn fetch_daemon_peers(listen_addr: &str) -> anyhow::Result<Vec<PeerInfo>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()?;
+    let url = format!("{}/api/v1/peers", local_daemon_url(listen_addr));
+    let peers: Vec<PeerInfo> = client.get(&url).send().await?.json().await?;
+    Ok(peers)
+}
+
+/// One-shot fetch: reuse the local daemon's warm peer state when available
+/// (no wait, includes bandwidth history), otherwise run one poll cycle; then
+/// find the best snapshot, download, exit. With `force`, the freshness gate
+/// is bypassed (`min_slots_behind` treated as 0).
 pub async fn fetch_once(mut config: Config, force: bool) -> anyhow::Result<()> {
     info!("one-shot snapshot fetch");
 
@@ -156,24 +189,30 @@ pub async fn fetch_once(mut config: Config, force: bool) -> anyhow::Result<()> {
 
     let peer_mgr = PeerManager::new(config.peers.clone(), metrics.clone());
 
-    // Run one poll cycle with a timeout to populate the peer list
-    info!("discovering and polling peers...");
-    let poll_fut = peer_mgr.poll_loop();
-    let timeout = tokio::time::sleep(std::time::Duration::from_secs(10));
-    tokio::select! {
-        _ = poll_fut => {}
-        _ = timeout => {}
+    match fetch_daemon_peers(&config.node.listen_addr).await {
+        Ok(peers) if !peers.is_empty() => {
+            info!(
+                peer_count = peers.len(),
+                "using warm peer state from local daemon"
+            );
+            peer_mgr.hydrate(peers).await;
+        }
+        _ => {
+            info!("no local daemon answering, polling peers directly...");
+            peer_mgr.poll_once().await;
+        }
     }
 
     let peer_count = peer_mgr.peer_count().await;
-    info!(peer_count, "poll cycle complete");
+    info!(peer_count, "peer discovery complete");
 
-    if peer_count == 0 {
+    if peer_count == 0 && !config.fallback.enabled {
         anyhow::bail!("no peers discovered, cannot fetch");
     }
 
     let orchestrator =
-        DownloadOrchestrator::new(config.download.clone(), index.clone(), peer_mgr, metrics);
+        DownloadOrchestrator::new(config.download.clone(), index.clone(), peer_mgr, metrics)
+            .with_fallback(fallback_manager(&config));
 
     match orchestrator.fetch_if_needed().await? {
         FetchOutcome::Downloaded => info!("fetch complete: downloaded new snapshot"),
@@ -301,6 +340,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn local_daemon_url_maps_wildcard_binds_to_loopback() {
+        assert_eq!(local_daemon_url("0.0.0.0:13080"), "http://127.0.0.1:13080");
+        assert_eq!(local_daemon_url("[::]:13080"), "http://127.0.0.1:13080");
+        assert_eq!(local_daemon_url("10.0.0.1:9000"), "http://10.0.0.1:9000");
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn watcher_refreshes_local_metrics_after_external_snapshot_creation() {

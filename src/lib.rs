@@ -1,6 +1,7 @@
 pub mod config;
 pub mod daemon;
 pub mod download;
+pub mod fallback;
 pub mod index;
 pub mod metrics;
 pub mod peer;

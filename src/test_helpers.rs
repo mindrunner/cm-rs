@@ -72,5 +72,6 @@ pub fn test_config(snap_dir: &Path, peer_addrs: Vec<String>) -> Config {
             enabled: false,
             check_interval: std::time::Duration::from_secs(30),
         },
+        fallback: Default::default(),
     }
 }

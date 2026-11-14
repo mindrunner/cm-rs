@@ -42,9 +42,13 @@ pub async fn download(
 
     let status = cmd.status().await.context("failed to spawn aria2c")?;
 
-    // aria2c exit code 5: aborted because download speed was too slow.
+    // aria2c exit code 5: aborted because download speed was too slow. It
+    // reports no speed, so the floor it fell below stands in for it.
     if status.code() == Some(5) {
-        return Err(SlowTransfer.into());
+        return Err(SlowTransfer {
+            measured_bps: min_speed as f64,
+        }
+        .into());
     }
     if !status.success() {
         anyhow::bail!("aria2c exited with {}", status);

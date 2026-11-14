@@ -40,8 +40,9 @@ file already in staging is reused by checksum instead of re-downloaded.
 
 ## Fetch policy
 
-`src/download/policy.rs`: pure decision logic — local snapshots + peer
+`src/download/policy.rs`: pure decision logic — local snapshots + **source**
 snapshots + config in, ordered **download plans** out, with a **fetch reason**.
+The same policy ranks peers and external sources.
 Validators generate their own snapshots; peer downloads exist for bootstrap
 and offline-too-long recovery, plus cheap incremental top-ups.
 
@@ -70,15 +71,33 @@ and offline-too-long recovery, plus cheap incremental top-ups.
 
 ## Download plan
 
-One attemptable unit: a peer, a full snapshot, an optional incremental, and
-whether the full is already local (**incremental-only**).
+One attemptable unit: a **source**, a full snapshot, an optional incremental,
+and whether the full is already local (**incremental-only**).
+
+## Source
+
+Where a plan downloads from (`SnapshotSource`): a **peer** (cm API) or an
+**external source** (agave convention: `{base}/snapshot.tar.bz2` redirects to
+the concrete file).
+
+## Fallback tier
+
+`src/fallback/`: opt-in (`[fallback] enabled`) external sources used when a
+**fallback trigger** fires: `no_peers`, `only_slow_peers` (every peer's recent
+bandwidth below `min_peer_bandwidth`; marks expire after 15 minutes), or
+`peer_plans_failed`. Candidates are configured **mirrors** plus RPC nodes from
+`getClusterNodes`; each round **probes** them (alias redirect, latency), drops
+those more than `max_slot_lag` behind the tip, speed-tests the fastest few,
+and caches the ranking for `cooldown`. External files carry no source
+checksum; the locally computed hash becomes the sidecar.
 
 ## Speed floor
 
 `min_speed` steers a cycle away from slow peers: a transfer below it for 60s
 is aborted and that peer's other plans are skipped for the cycle. The floor
-applies only while a plan from another usable peer remains, so the last
-candidate is never abandoned while it makes progress. A transfer that moves
+applies only while a plan from another usable source remains (including the
+fallback tier when it still has sources this cycle), so the last candidate is
+never abandoned while it makes progress. A transfer that moves
 no bytes for 60s is always aborted.
 
 ## Download backend

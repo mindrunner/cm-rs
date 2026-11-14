@@ -40,6 +40,32 @@ impl ReasonLabel {
     }
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct TriggerLabel {
+    pub trigger: String,
+}
+
+impl TriggerLabel {
+    pub fn new(trigger: &str) -> Self {
+        Self {
+            trigger: trigger.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct SourceLabel {
+    pub source: String,
+}
+
+impl SourceLabel {
+    pub fn new(source: &str) -> Self {
+        Self {
+            source: source.to_string(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Metrics {
     pub registry: Arc<RwLock<Registry>>,
@@ -53,6 +79,8 @@ pub struct Metrics {
     pub download_duration: Histogram,
     pub download_bytes: Counter,
     pub downloads_by_reason: Family<ReasonLabel, Counter>,
+    pub fallback_attempts: Family<TriggerLabel, Counter>,
+    pub fallback_downloads: Family<SourceLabel, Counter>,
     pub s3_upload_duration: Histogram,
 }
 
@@ -135,6 +163,20 @@ impl Metrics {
             downloads_by_reason.clone(),
         );
 
+        let fallback_attempts = Family::<TriggerLabel, Counter>::default();
+        reg.register(
+            "cm_fallback_attempts",
+            "External-source fallback attempts by trigger (no_peers, only_slow_peers, peer_plans_failed)",
+            fallback_attempts.clone(),
+        );
+
+        let fallback_downloads = Family::<SourceLabel, Counter>::default();
+        reg.register(
+            "cm_fallback_downloads",
+            "Completed downloads from external fallback sources",
+            fallback_downloads.clone(),
+        );
+
         let s3_upload_duration = Histogram::new(exponential_buckets(1.0, 2.0, 15));
         reg.register(
             "cm_s3_upload_duration_seconds",
@@ -153,6 +195,8 @@ impl Metrics {
             download_duration,
             download_bytes,
             downloads_by_reason,
+            fallback_attempts,
+            fallback_downloads,
             s3_upload_duration,
         }
     }

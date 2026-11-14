@@ -6,10 +6,77 @@ use std::collections::HashSet;
 use crate::peer::PeerInfo;
 use crate::snapshot::{SnapshotInfo, SnapshotType};
 
+/// Where a snapshot can be downloaded from: a cm peer (served through the cm
+/// API) or an external source following the agave snapshot URL convention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotSource {
+    Peer { addr: String },
+    External { base_url: String },
+}
+
+impl SnapshotSource {
+    pub fn peer(addr: impl Into<String>) -> Self {
+        Self::Peer { addr: addr.into() }
+    }
+
+    pub fn external(base_url: impl Into<String>) -> Self {
+        Self::External {
+            base_url: base_url.into(),
+        }
+    }
+
+    /// Download URL for a snapshot file served by this source.
+    pub fn url_for(&self, file_name: &str) -> String {
+        match self {
+            Self::Peer { addr } => format!("http://{}/api/v1/snapshot/{}", addr, file_name),
+            Self::External { base_url } => {
+                format!("{}/{}", base_url.trim_end_matches('/'), file_name)
+            }
+        }
+    }
+
+    /// The cm peer address, when this source is a peer.
+    pub fn peer_addr(&self) -> Option<&str> {
+        match self {
+            Self::Peer { addr } => Some(addr),
+            Self::External { .. } => None,
+        }
+    }
+
+    /// Human-readable identity for logs and metrics.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Peer { addr } => addr,
+            Self::External { base_url } => base_url,
+        }
+    }
+}
+
+/// A source together with the snapshots it advertises — the unit the fetch
+/// policy ranks over, regardless of whether the source is a peer or external.
+#[derive(Debug, Clone)]
+pub struct SourceView {
+    pub source: SnapshotSource,
+    pub snapshots: Vec<SnapshotInfo>,
+}
+
+impl SourceView {
+    pub fn from_peer(peer: &PeerInfo) -> Self {
+        Self {
+            source: SnapshotSource::peer(peer.addr.clone()),
+            snapshots: peer.snapshots.clone(),
+        }
+    }
+
+    pub fn highest_slot(&self) -> u64 {
+        crate::snapshot::highest_usable_slot(&self.snapshots)
+    }
+}
+
 /// A downloadable snapshot set: the full snapshot and an optional incremental.
 #[derive(Debug, Clone)]
 pub struct DownloadPlan {
-    pub peer_addr: String,
+    pub source: SnapshotSource,
     pub full: SnapshotInfo,
     pub incremental: Option<SnapshotInfo>,
     /// Local node already has `full`; only download the incremental.
@@ -61,35 +128,35 @@ pub fn plan_resulting_bootstrap(plan: &DownloadPlan) -> u64 {
         .unwrap_or(plan.full.slot)
 }
 
-pub fn build_download_plan(peer: &PeerInfo, _target_slot: u64) -> Option<DownloadPlan> {
+pub fn build_download_plan(source: &SourceView, _target_slot: u64) -> Option<DownloadPlan> {
     // Find the best full snapshot at or near the target
-    let full = peer
+    let full = source
         .snapshots
         .iter()
         .filter(|s| s.snapshot_type == SnapshotType::Full)
         .max_by_key(|s| s.slot)?;
 
     // Find the best incremental for this full snapshot's base
-    let incremental = best_incremental_for(&peer.snapshots, full.slot, 0);
+    let incremental = best_incremental_for(&source.snapshots, full.slot, 0);
 
     Some(DownloadPlan {
-        peer_addr: peer.addr.clone(),
+        source: source.source.clone(),
         full: full.clone(),
         incremental: incremental.cloned(),
         incremental_only: false,
     })
 }
 
-/// Ranked incremental plans on `local_full` from all peers, ahead of `local_bootstrap`.
+/// Ranked incremental plans on `local_full` from all sources, ahead of `local_bootstrap`.
 pub fn rank_incremental_plans(
-    peers: &[PeerInfo],
+    sources: &[SourceView],
     local_full: &SnapshotInfo,
     local_bootstrap: u64,
 ) -> Vec<DownloadPlan> {
     let mut plans: Vec<(u64, DownloadPlan)> = Vec::new();
 
-    for peer in peers {
-        let Some(inc) = peer
+    for source in sources {
+        let Some(inc) = source
             .snapshots
             .iter()
             .filter(|s| {
@@ -105,7 +172,7 @@ pub fn rank_incremental_plans(
         plans.push((
             inc.slot,
             DownloadPlan {
-                peer_addr: peer.addr.clone(),
+                source: source.source.clone(),
                 full: local_full.clone(),
                 incremental: Some(inc.clone()),
                 incremental_only: true,
@@ -117,22 +184,22 @@ pub fn rank_incremental_plans(
     plans.into_iter().map(|(_, plan)| plan).collect()
 }
 
-/// Ranked newer-full plans from all peers, best bootstrap slot first.
+/// Ranked newer-full plans from all sources, best bootstrap slot first.
 pub fn rank_newer_full_plans(
-    peers: &[PeerInfo],
+    sources: &[SourceView],
     local_full_slot: Option<u64>,
     local_bootstrap: u64,
 ) -> Vec<DownloadPlan> {
     let floor = local_full_slot.unwrap_or(0);
     let mut plans: Vec<(u64, DownloadPlan)> = Vec::new();
 
-    for peer in peers {
-        for full in peer
+    for source in sources {
+        for full in source
             .snapshots
             .iter()
             .filter(|s| s.is_full() && s.slot > floor)
         {
-            let incremental = best_incremental_for(&peer.snapshots, full.slot, 0).cloned();
+            let incremental = best_incremental_for(&source.snapshots, full.slot, 0).cloned();
 
             let resulting_bootstrap = incremental.as_ref().map(|i| i.slot).unwrap_or(full.slot);
             if resulting_bootstrap <= local_bootstrap {
@@ -142,7 +209,7 @@ pub fn rank_newer_full_plans(
             plans.push((
                 resulting_bootstrap,
                 DownloadPlan {
-                    peer_addr: peer.addr.clone(),
+                    source: source.source.clone(),
                     full: full.clone(),
                     incremental,
                     incremental_only: false,
@@ -225,7 +292,7 @@ pub struct FetchDecision {
 /// plans on the local full stay ungated: they are cheap top-ups.
 pub fn decide(
     local_snaps: &[SnapshotInfo],
-    peers: &[PeerInfo],
+    sources: &[SourceView],
     min_slots_behind: u64,
 ) -> FetchDecision {
     let local_bootstrap = agave_bootstrap_slot(local_snaps);
@@ -234,7 +301,7 @@ pub fn decide(
         .filter(|s| s.is_full())
         .max_by_key(|s| s.slot);
     let local_full_slot = local_full.map(|s| s.slot);
-    let best_remote_slot = peers.iter().map(|p| p.highest_slot()).max().unwrap_or(0);
+    let best_remote_slot = sources.iter().map(|s| s.highest_slot()).max().unwrap_or(0);
 
     let gate = full_fetch_gate(local_bootstrap, best_remote_slot, min_slots_behind);
     let is_bootstrap = local_full.is_none() && best_remote_slot > 0;
@@ -243,14 +310,14 @@ pub fn decide(
 
     // Incremental top-ups on the local full: ungated, always cheap.
     if let Some(local_full) = local_full {
-        plans.extend(rank_incremental_plans(peers, local_full, local_bootstrap));
+        plans.extend(rank_incremental_plans(sources, local_full, local_bootstrap));
     }
 
     // Full-snapshot plans: only on bootstrap or when the gate opens, and each
     // plan must clear the improvement floor (bypassed on bootstrap).
     if is_bootstrap || matches!(gate, FullFetchGate::Seek { .. }) {
         plans.extend(
-            rank_newer_full_plans(peers, local_full_slot, local_bootstrap)
+            rank_newer_full_plans(sources, local_full_slot, local_bootstrap)
                 .into_iter()
                 .filter(|p| {
                     is_bootstrap
@@ -297,32 +364,99 @@ pub fn decide(
 /// How to attempt one plan of a cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanAttempt {
-    /// The peer tripped the speed floor earlier this cycle and another usable
-    /// peer's plan remains.
+    /// The source tripped the speed floor earlier this cycle and another usable
+    /// candidate remains.
     Skip,
     /// Attempt with this speed floor; 0 aborts only on a stall.
     Run { min_speed: u64 },
 }
 
-/// Decide how to attempt `plans[i]` given the peers that already tripped the
+/// Decide how to attempt `plans[i]` given the sources that already tripped the
 /// speed floor this cycle. The floor only applies while a plan from another
-/// usable peer remains, so the last candidate is never abandoned while it is
-/// still making progress.
+/// usable source remains, so the last candidate is never abandoned while it is
+/// still making progress. `backup_remains` counts a later tier (external
+/// sources still to try this cycle) as such a candidate.
 pub fn plan_attempt(
     plans: &[DownloadPlan],
     i: usize,
-    slow_peers: &HashSet<&str>,
+    slow_sources: &HashSet<&str>,
     min_speed: u64,
+    backup_remains: bool,
 ) -> PlanAttempt {
-    let peer = plans[i].peer_addr.as_str();
-    let fallback_left = plans[i + 1..]
-        .iter()
-        .any(|p| p.peer_addr != peer && !slow_peers.contains(p.peer_addr.as_str()));
-    match (slow_peers.contains(peer), fallback_left) {
+    let source = plans[i].source.label();
+    let fallback_left = backup_remains
+        || plans[i + 1..].iter().any(|p| {
+            let other = p.source.label();
+            other != source && !slow_sources.contains(other)
+        });
+    match (slow_sources.contains(source), fallback_left) {
         (true, true) => PlanAttempt::Skip,
         (_, true) => PlanAttempt::Run { min_speed },
         (_, false) => PlanAttempt::Run { min_speed: 0 },
     }
+}
+
+/// Why the external-source fallback tier is being engaged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackTrigger {
+    /// No cm peers are known at all.
+    NoPeers,
+    /// Every peer with a measured bandwidth is below the configured minimum.
+    OnlySlowPeers,
+    /// Peers offered plans this cycle, but every one of them failed.
+    PeerPlansFailed,
+}
+
+impl FallbackTrigger {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoPeers => "no_peers",
+            Self::OnlySlowPeers => "only_slow_peers",
+            Self::PeerPlansFailed => "peer_plans_failed",
+        }
+    }
+}
+
+/// How long a slow-bandwidth measurement keeps counting against a peer.
+/// Without an expiry, one bad cycle would route around peers forever: a
+/// successful fallback returns before any peer plan runs, so peer bandwidth
+/// would never be remeasured. After this window the mark lapses, the peer
+/// counts as unmeasured (= not slow), and the peer tier gets retried.
+pub const SLOW_MARK_TTL_SECS: u64 = 900;
+
+/// A peer counts as slow only while a *recent* measurement says so; an
+/// unmeasured peer (or one whose slow mark has expired) deserves a real
+/// download attempt first.
+pub fn peer_is_slow(stats: &crate::peer::PeerStats, min_bandwidth_bps: u64, now_unix: u64) -> bool {
+    let Some(bw) = stats.bandwidth_bps else {
+        return false;
+    };
+    let Some(at) = stats.bandwidth_at else {
+        return false;
+    };
+    now_unix.saturating_sub(at) <= SLOW_MARK_TTL_SECS && bw < min_bandwidth_bps as f64
+}
+
+/// Trigger evaluated before the peer download loop: engage the fallback tier
+/// when there are no peers at all, or when every peer is measurably slow
+/// (`min_peer_bandwidth` > 0). `PeerPlansFailed` is decided by the caller
+/// after the peer loop, not here.
+pub fn pre_fetch_fallback_trigger(
+    peers: &[PeerInfo],
+    min_peer_bandwidth: u64,
+    now_unix: u64,
+) -> Option<FallbackTrigger> {
+    if peers.is_empty() {
+        return Some(FallbackTrigger::NoPeers);
+    }
+    if min_peer_bandwidth > 0
+        && peers
+            .iter()
+            .all(|p| peer_is_slow(&p.stats, min_peer_bandwidth, now_unix))
+    {
+        return Some(FallbackTrigger::OnlySlowPeers);
+    }
+    None
 }
 
 /// Staleness of a full-only download (no incremental obtained) relative to the
@@ -366,11 +500,32 @@ mod tests {
         }
     }
 
-    fn make_peer(addr: &str, snapshots: Vec<SnapshotInfo>) -> PeerInfo {
+    fn make_peer(addr: &str, snapshots: Vec<SnapshotInfo>) -> SourceView {
+        SourceView {
+            source: SnapshotSource::peer(addr),
+            snapshots,
+        }
+    }
+
+    fn make_external(base_url: &str, snapshots: Vec<SnapshotInfo>) -> SourceView {
+        SourceView {
+            source: SnapshotSource::external(base_url),
+            snapshots,
+        }
+    }
+
+    /// Fixed "now" for trigger tests; fresh measurements are stamped with it.
+    const NOW: u64 = 1_000_000;
+
+    fn peer_with_stats(addr: &str, bandwidth_bps: Option<f64>) -> PeerInfo {
         PeerInfo {
             addr: addr.into(),
-            snapshots,
-            stats: PeerStats::default(),
+            snapshots: Vec::new(),
+            stats: PeerStats {
+                bandwidth_bps,
+                bandwidth_at: bandwidth_bps.map(|_| NOW),
+                ..Default::default()
+            },
         }
     }
 
@@ -440,7 +595,7 @@ mod tests {
         ];
         let plans = rank_incremental_plans(&peers, &local_full, 250);
         assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].peer_addr, "host:2");
+        assert_eq!(plans[0].source.peer_addr(), Some("host:2"));
         assert_eq!(plans[0].incremental.as_ref().unwrap().slot, 280);
     }
 
@@ -750,8 +905,8 @@ mod tests {
         ];
         let decision = decide(&local, &peers, 0);
         assert_eq!(decision.plans.len(), 2);
-        assert_eq!(decision.plans[0].peer_addr, "host:1");
-        assert_eq!(decision.plans[1].peer_addr, "host:2");
+        assert_eq!(decision.plans[0].source.peer_addr(), Some("host:1"));
+        assert_eq!(decision.plans[1].source.peer_addr(), Some("host:2"));
     }
 
     #[test]
@@ -786,7 +941,7 @@ mod tests {
     #[test]
     fn plan_resulting_bootstrap_uses_incremental_when_present() {
         let with_inc = DownloadPlan {
-            peer_addr: "host:1".into(),
+            source: SnapshotSource::peer("host:1"),
             full: make_snap(1000, true, None),
             incremental: Some(make_snap(1500, false, Some(1000))),
             incremental_only: false,
@@ -799,9 +954,115 @@ mod tests {
         assert_eq!(plan_resulting_bootstrap(&full_only), 1000);
     }
 
+    #[test]
+    fn url_for_peer_uses_cm_api_path() {
+        let src = SnapshotSource::peer("host:13080");
+        assert_eq!(
+            src.url_for("snapshot-100-hash.tar.zst"),
+            "http://host:13080/api/v1/snapshot/snapshot-100-hash.tar.zst"
+        );
+    }
+
+    #[test]
+    fn url_for_external_joins_base_url() {
+        let src = SnapshotSource::external("https://mirror.example.com/snapshots/");
+        assert_eq!(
+            src.url_for("snapshot-100-hash.tar.zst"),
+            "https://mirror.example.com/snapshots/snapshot-100-hash.tar.zst"
+        );
+        let no_slash = SnapshotSource::external("https://mirror.example.com/snapshots");
+        assert_eq!(
+            no_slash.url_for("f.tar.zst"),
+            "https://mirror.example.com/snapshots/f.tar.zst"
+        );
+    }
+
+    #[test]
+    fn decide_over_external_sources() {
+        // Bootstrap purely from an external mirror: same gating as peers.
+        let sources = vec![make_external(
+            "https://mirror.example.com/snapshots",
+            vec![
+                make_snap(5000, true, None),
+                make_snap(5100, false, Some(5000)),
+            ],
+        )];
+        let decision = decide(&[], &sources, 0);
+        assert_eq!(decision.reason, Some(FetchReason::Bootstrap));
+        assert_eq!(decision.plans.len(), 1);
+        assert_eq!(decision.plans[0].source.peer_addr(), None);
+        assert_eq!(decision.plans[0].full.slot, 5000);
+        assert_eq!(decision.plans[0].incremental.as_ref().unwrap().slot, 5100);
+    }
+
+    #[test]
+    fn decide_mixed_sources_ranked_by_slot() {
+        // A fresher external chain outranks a staler peer chain and vice versa.
+        let sources = vec![
+            make_peer("host:1", vec![make_snap(3000, true, None)]),
+            make_external("https://m.example.com", vec![make_snap(4000, true, None)]),
+        ];
+        let decision = decide(&[], &sources, 0);
+        assert_eq!(decision.plans.len(), 2);
+        assert_eq!(decision.plans[0].full.slot, 4000);
+        assert_eq!(decision.plans[0].source.peer_addr(), None);
+        assert_eq!(decision.plans[1].source.peer_addr(), Some("host:1"));
+    }
+
+    #[test]
+    fn trigger_no_peers() {
+        assert_eq!(
+            pre_fetch_fallback_trigger(&[], 10_000_000, NOW),
+            Some(FallbackTrigger::NoPeers)
+        );
+        // Threshold disabled still detects the empty peer set.
+        assert_eq!(
+            pre_fetch_fallback_trigger(&[], 0, NOW),
+            Some(FallbackTrigger::NoPeers)
+        );
+    }
+
+    #[test]
+    fn trigger_all_measured_slow() {
+        let peers = vec![
+            peer_with_stats("a:1", Some(1_000_000.0)),
+            peer_with_stats("b:1", Some(5_000_000.0)),
+        ];
+        assert_eq!(
+            pre_fetch_fallback_trigger(&peers, 10_000_000, NOW),
+            Some(FallbackTrigger::OnlySlowPeers)
+        );
+    }
+
+    #[test]
+    fn trigger_one_fast_peer_disarms() {
+        let peers = vec![
+            peer_with_stats("a:1", Some(1_000_000.0)),
+            peer_with_stats("b:1", Some(50_000_000.0)),
+        ];
+        assert_eq!(pre_fetch_fallback_trigger(&peers, 10_000_000, NOW), None);
+    }
+
+    #[test]
+    fn trigger_unmeasured_peer_counts_as_not_slow() {
+        // A fresh peer without bandwidth history deserves a real attempt
+        // before we route around it.
+        let peers = vec![
+            peer_with_stats("a:1", Some(1_000_000.0)),
+            peer_with_stats("b:1", None),
+        ];
+        assert_eq!(pre_fetch_fallback_trigger(&peers, 10_000_000, NOW), None);
+    }
+
+    #[test]
+    fn trigger_threshold_zero_disables_slow_detection() {
+        let peers = vec![peer_with_stats("a:1", Some(1.0))];
+        assert_eq!(pre_fetch_fallback_trigger(&peers, 0, NOW), None);
+    }
+
     fn full_plan(peer: &str, slot: u64) -> DownloadPlan {
         DownloadPlan {
-            peer_addr: peer.into(),
+            source: SnapshotSource::peer(peer),
             full: make_snap(slot, true, None),
             incremental: None,
             incremental_only: false,
@@ -813,11 +1074,11 @@ mod tests {
         let plans = vec![full_plan("a:1", 300), full_plan("b:1", 200)];
         let slow = HashSet::new();
         assert_eq!(
-            plan_attempt(&plans, 0, &slow, 50),
+            plan_attempt(&plans, 0, &slow, 50, false),
             PlanAttempt::Run { min_speed: 50 }
         );
         assert_eq!(
-            plan_attempt(&plans, 1, &slow, 50),
+            plan_attempt(&plans, 1, &slow, 50, false),
             PlanAttempt::Run { min_speed: 0 }
         );
     }
@@ -832,12 +1093,12 @@ mod tests {
         ];
         let slow: HashSet<&str> = ["a:1"].into();
         assert_eq!(
-            plan_attempt(&plans, 1, &slow, 50),
+            plan_attempt(&plans, 1, &slow, 50, false),
             PlanAttempt::Run { min_speed: 0 }
         );
         let same_peer = vec![full_plan("a:1", 400), full_plan("a:1", 300)];
         assert_eq!(
-            plan_attempt(&same_peer, 0, &HashSet::new(), 50),
+            plan_attempt(&same_peer, 0, &HashSet::new(), 50, false),
             PlanAttempt::Run { min_speed: 0 }
         );
     }
@@ -851,11 +1112,46 @@ mod tests {
             full_plan("a:1", 100),
         ];
         let slow: HashSet<&str> = ["a:1"].into();
-        assert_eq!(plan_attempt(&plans, 1, &slow, 50), PlanAttempt::Skip);
+        assert_eq!(plan_attempt(&plans, 1, &slow, 50, false), PlanAttempt::Skip);
         // b:1 failed for another reason; a:1 is all that is left.
         assert_eq!(
-            plan_attempt(&plans, 3, &slow, 50),
+            plan_attempt(&plans, 3, &slow, 50, false),
             PlanAttempt::Run { min_speed: 0 }
         );
+    }
+
+    #[test]
+    fn plan_attempt_keeps_floor_when_backup_tier_remains() {
+        // External sources still to try: the last peer keeps the floor, and
+        // a slow peer is skipped in favour of them.
+        let plans = vec![full_plan("a:1", 300)];
+        assert_eq!(
+            plan_attempt(&plans, 0, &HashSet::new(), 50, true),
+            PlanAttempt::Run { min_speed: 50 }
+        );
+        let slow: HashSet<&str> = ["a:1"].into();
+        assert_eq!(plan_attempt(&plans, 0, &slow, 50, true), PlanAttempt::Skip);
+    }
+
+    #[test]
+    fn trigger_slow_mark_expires() {
+        // A slow measurement older than the TTL no longer counts: the peer
+        // reverts to "unmeasured" and the peer tier gets retried.
+        let peers = vec![peer_with_stats("a:1", Some(1_000_000.0))];
+        let later = NOW + SLOW_MARK_TTL_SECS + 1;
+        assert_eq!(
+            pre_fetch_fallback_trigger(&peers, 10_000_000, NOW),
+            Some(FallbackTrigger::OnlySlowPeers)
+        );
+        assert_eq!(pre_fetch_fallback_trigger(&peers, 10_000_000, later), None);
+    }
+
+    #[test]
+    fn trigger_missing_timestamp_counts_as_not_slow() {
+        // Hydrated stats from an older daemon may lack bandwidth_at; treat
+        // them as unmeasured rather than permanently slow.
+        let mut peer = peer_with_stats("a:1", Some(1_000_000.0));
+        peer.stats.bandwidth_at = None;
+        assert_eq!(pre_fetch_fallback_trigger(&[peer], 10_000_000, NOW), None);
     }
 }
