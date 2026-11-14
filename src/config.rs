@@ -218,7 +218,8 @@ pub struct FallbackConfig {
     /// Reject external snapshots more than this many slots behind the cluster tip.
     #[serde(default = "default_max_slot_lag")]
     pub max_slot_lag: u64,
-    /// Speed-test only the N lowest-latency candidates.
+    /// Speed-test the N lowest-latency discovered nodes; configured mirrors
+    /// are always speed-tested on top of these.
     #[serde(default = "default_max_candidates")]
     pub max_candidates: usize,
     #[serde(default = "default_probe_concurrency")]

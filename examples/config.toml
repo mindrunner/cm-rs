@@ -148,7 +148,8 @@ enabled = false
 # Default: 1300
 # max_slot_lag = 1300
 
-# Speed-test only the N lowest-latency candidates.
+# Speed-test the N lowest-latency discovered nodes. Configured mirrors are
+# always speed-tested on top of these.
 # Default: 5
 # max_candidates = 5
 

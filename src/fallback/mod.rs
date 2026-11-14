@@ -151,9 +151,8 @@ impl FallbackManager {
             });
         }
 
-        // Speed-test only the lowest-latency candidates.
-        probed.sort_by(|a, b| a.latency_ms.total_cmp(&b.latency_ms));
-        probed.truncate(self.config.max_candidates.max(1));
+        let probed =
+            select_for_speed_test(probed, &self.config.mirrors, self.config.max_candidates);
 
         let mut measured: Vec<(f64, ProbedSource)> = Vec::with_capacity(probed.len());
         for p in probed {
@@ -204,5 +203,67 @@ impl FallbackManager {
                 }
             })
             .collect()
+    }
+}
+
+/// Candidates to speed-test: every configured mirror, plus the
+/// `max_candidates` lowest-latency discovered nodes. Mirrors are never
+/// dropped for latency: a CDN-backed mirror answers the probe slowly but
+/// downloads far faster than a typical RPC node, and only the speed test
+/// can tell.
+fn select_for_speed_test(
+    probed: Vec<ProbedSource>,
+    mirrors: &[String],
+    max_candidates: usize,
+) -> Vec<ProbedSource> {
+    let is_mirror = |p: &ProbedSource| {
+        mirrors
+            .iter()
+            .any(|m| m.trim_end_matches('/') == p.base_url)
+    };
+    let (mut selected, mut discovered): (Vec<_>, Vec<_>) =
+        probed.into_iter().partition(|p| is_mirror(p));
+    discovered.sort_by(|a, b| a.latency_ms.total_cmp(&b.latency_ms));
+    discovered.truncate(max_candidates.max(1));
+    selected.extend(discovered);
+    selected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::SnapshotInfo;
+
+    fn probed(base: &str, latency_ms: f64) -> ProbedSource {
+        ProbedSource {
+            base_url: base.into(),
+            full: SnapshotInfo::from_filename("snapshot-100-h.tar.zst", 0, 0).unwrap(),
+            full_url: format!("{}/snapshot-100-h.tar.zst", base),
+            incremental: None,
+            latency_ms,
+        }
+    }
+
+    #[test]
+    fn slow_answering_mirror_is_still_speed_tested() {
+        // Testnet 2026-11-14: avorio answered the probe in ~350 ms, behind
+        // 50 RPC nodes at ~50-75 ms, and was never measured.
+        let mut all: Vec<_> = (0..10)
+            .map(|i| probed(&format!("http://10.0.0.{i}:8899"), 50.0 + i as f64))
+            .collect();
+        all.push(probed("https://mirror.example/testnet", 350.0));
+        let mirrors = vec!["https://mirror.example/testnet/".to_string()];
+
+        let chosen = select_for_speed_test(all, &mirrors, 3);
+        let bases: Vec<_> = chosen.iter().map(|p| p.base_url.as_str()).collect();
+        assert_eq!(
+            bases,
+            [
+                "https://mirror.example/testnet",
+                "http://10.0.0.0:8899",
+                "http://10.0.0.1:8899",
+                "http://10.0.0.2:8899",
+            ]
+        );
     }
 }
