@@ -143,8 +143,13 @@ impl SnapshotIndex {
 
         let name_set: std::collections::HashSet<&str> = names.iter().map(|n| n.as_str()).collect();
         for name in &names {
-            let is_marker = name.ends_with(".aria2");
-            let payload = name.strip_suffix(".aria2").unwrap_or(name);
+            // Markers ride along with their payload file: `.aria2` resume
+            // control files and `.sha256` verified-download sidecars.
+            let is_marker = name.ends_with(".aria2") || name.ends_with(".sha256");
+            let payload = name
+                .strip_suffix(".aria2")
+                .or_else(|| name.strip_suffix(".sha256"))
+                .unwrap_or(name);
             let fresh = snapshot::primary_slot(payload).is_some_and(|s| s > keep_min_slot);
             let keep = fresh && (!is_marker || name_set.contains(payload));
             if !keep {

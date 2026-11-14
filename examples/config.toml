@@ -115,6 +115,65 @@ enabled = false
 # upload_interval = "5m"
 
 # ---------------------------------------------------------------------------
+# Fallback — external snapshot sources (mirrors + gossip RPC nodes)
+#
+# Used when no cm peers are known, every measured peer is slower than
+# min_peer_bandwidth, or all peer downloads failed in a cycle. Candidates are
+# probed, filtered by slot lag, speed-tested, and tried fastest-first.
+# External archives have no source-reported checksum, so this tier is opt-in.
+# ---------------------------------------------------------------------------
+[fallback]
+
+# Enable the external fallback tier.
+# Default: false
+enabled = false
+
+# Static mirror base URLs following the agave snapshot convention
+# ({base}/snapshot.tar.bz2 redirects to the concrete file).
+# Default: ["https://snapshots.avorio.network/mainnet-beta"]
+# mirrors = ["https://snapshots.avorio.network/mainnet-beta"]
+
+# Solana RPC endpoints used to discover snapshot-serving cluster nodes
+# (getClusterNodes) and the cluster tip (getSlot). Set to [] to disable
+# RPC-node discovery and use only the static mirrors.
+# Default: ["https://api.mainnet-beta.solana.com"]
+# rpc_urls = ["https://api.mainnet-beta.solana.com"]
+
+# Peers with measured bandwidth below this (bytes/sec) count as slow; if ALL
+# measured peers are slow, external sources are tried first. 0 = disabled.
+# Default: 10000000 (10 MB/s)
+# min_peer_bandwidth = 10000000
+
+# Reject external snapshots more than this many slots behind the cluster tip.
+# Default: 1300
+# max_slot_lag = 1300
+
+# Speed-test only the N lowest-latency candidates.
+# Default: 5
+# max_candidates = 5
+
+# Concurrent probe requests during discovery.
+# Default: 16
+# probe_concurrency = 16
+
+# Bytes downloaded per candidate when measuring speed.
+# Default: 16777216 (16 MiB)
+# speed_test_bytes = 16777216
+
+# Drop candidates measuring below this (bytes/sec). 0 = accept any.
+# Default: 0
+# min_source_speed = 0
+
+# Timeouts for probing and speed testing.
+# probe_timeout = "5s"
+# speed_test_timeout = "15s"
+
+# Probe results are cached and reused within this window, so external
+# endpoints are not hammered by every fetch cycle.
+# Default: "10m"
+# cooldown = "10m"
+
+# ---------------------------------------------------------------------------
 # Auto — periodic automatic snapshot fetching
 # ---------------------------------------------------------------------------
 [auto]

@@ -16,10 +16,12 @@ use crate::peer::PeerManager;
 use crate::snapshot::{self, SnapshotInfo};
 
 pub use policy::{
-    DownloadPlan, FetchDecision, FetchReason, FullFetchGate, PlanAttempt, agave_bootstrap_slot,
-    build_download_plan, decide, plan_resulting_bootstrap, rank_incremental_plans,
-    rank_newer_full_plans,
+    DownloadPlan, FallbackTrigger, FetchDecision, FetchReason, FullFetchGate, PlanAttempt,
+    SnapshotSource, SourceView, agave_bootstrap_slot, build_download_plan, decide,
+    plan_resulting_bootstrap, rank_incremental_plans, rank_newer_full_plans,
 };
+
+use crate::fallback::FallbackManager;
 
 /// Result of a backend download: bytes written and SHA-256 hex digest.
 pub struct DownloadResult {
@@ -28,9 +30,13 @@ pub struct DownloadResult {
 }
 
 /// The progress watchdog gave up on a transfer: below `min_speed`, or no
-/// bytes at all, for a whole window.
+/// bytes at all, for a whole window. `measured_bps` is the last measured
+/// speed (builtin backend) or the floor it fell below (aria2c, which reports
+/// no speed), so callers can mark the source as slow.
 #[derive(Debug)]
-pub struct SlowTransfer;
+pub struct SlowTransfer {
+    pub measured_bps: f64,
+}
 
 impl std::fmt::Display for SlowTransfer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -45,12 +51,21 @@ impl std::error::Error for SlowTransfer {}
 pub enum FetchOutcome {
     /// A snapshot was downloaded and admitted.
     Downloaded,
-    /// No peer is far enough ahead of the local bootstrap to justify a download.
+    /// No source is far enough ahead of the local bootstrap to justify a download.
     NotNeeded,
-    /// No ranked peer to plan against.
+    /// No ranked peer (and no usable external source) to plan against.
     NoPeers,
     /// The cycle wanted a snapshot for this reason and none landed.
     Unresolved(FetchReason),
+}
+
+/// Result of attempting one tier's plans.
+enum PlansResult {
+    /// A plan from this source landed.
+    Downloaded(SnapshotSource),
+    /// Nothing landed; `any_err` is true when at least one plan failed
+    /// (rather than every plan being already satisfied locally).
+    Failed { any_err: bool },
 }
 
 /// A successfully downloaded file in the staging directory.
@@ -60,23 +75,85 @@ struct DownloadedFile {
     bytes: u64,
 }
 
+/// Resolve where to actually download `planned` from an external source.
+///
+/// Mirrors like avorio only serve files through the alias redirect (a
+/// short-lived presigned URL) and 404 the concrete `{base}/{file}` path, so
+/// re-resolve the alias at download time. A full must resolve to exactly the
+/// planned file — substituting a rotated full would desync the plan's
+/// staleness gate and incremental pairing. A rotated *incremental* on the
+/// same base is accepted: it pairs with the same full and only improves the
+/// resulting bootstrap. Anything else falls back to the direct path (agave
+/// RPC nodes serve concrete filenames).
+async fn resolve_external_download(
+    fallback: Option<&FallbackManager>,
+    source: &SnapshotSource,
+    planned: &SnapshotInfo,
+) -> (String, SnapshotInfo) {
+    let direct = (source.url_for(&planned.file_name), planned.clone());
+    let (Some(fallback), SnapshotSource::External { base_url }) = (fallback, source) else {
+        return direct;
+    };
+
+    let alias = if planned.is_full() {
+        crate::fallback::probe::FULL_ALIAS
+    } else {
+        crate::fallback::probe::INCREMENTAL_ALIAS
+    };
+
+    if let Some((url, actual)) =
+        crate::fallback::probe::resolve_alias(fallback.probe_client(), base_url, alias).await
+    {
+        let acceptable = if planned.is_full() {
+            actual.file_name == planned.file_name
+        } else {
+            !actual.is_full()
+                && actual.base_slot == planned.base_slot
+                && actual.slot >= planned.slot
+        };
+        if acceptable {
+            if actual.file_name != planned.file_name {
+                info!(
+                    planned = planned.file_name,
+                    actual = actual.file_name,
+                    "external source rotated its incremental; downloading current one"
+                );
+            }
+            return (url, actual);
+        }
+    }
+
+    direct
+}
+
 /// Download a single snapshot file to `tmp_dir`, verify its checksum, and
 /// return metadata about the downloaded file. `min_speed` overrides the
 /// configured floor (0 = abort only on a stall).
 async fn download_one_file(
     config: &DownloadConfig,
-    peer_addr: &str,
+    fallback: Option<&FallbackManager>,
+    source: &SnapshotSource,
     file: &SnapshotInfo,
     tmp_dir: &Path,
     min_speed: u64,
 ) -> Result<DownloadedFile> {
-    let url = format!("http://{}/api/v1/snapshot/{}", peer_addr, file.file_name);
+    let (url, file) = match source {
+        SnapshotSource::Peer { .. } => (source.url_for(&file.file_name), file.clone()),
+        SnapshotSource::External { .. } => resolve_external_download(fallback, source, file).await,
+    };
+    let file = &file;
     let dest = tmp_dir.join(&file.file_name);
 
-    // Reuse a previously staged file whose contents already match the
-    // peer-reported hash (e.g. a verified full kept after a staleness bail) —
-    // hashing is minutes, re-downloading is hours.
-    if let Some(ref expected) = file.sha256
+    // Reuse a previously staged file whose contents already match a known
+    // hash (e.g. a verified full kept after a staleness bail) — hashing is
+    // minutes, re-downloading is hours. External sources report no hash, so
+    // fall back to the sidecar written into staging after a completed
+    // download (see the staleness bail in `download_plan`).
+    let expected_hash = file
+        .sha256
+        .clone()
+        .or_else(|| crate::snapshot::load_sidecar_hash(&dest));
+    if let Some(ref expected) = expected_hash
         && tokio::fs::try_exists(&dest).await.unwrap_or(false)
     {
         let path = dest.clone();
@@ -136,6 +213,7 @@ pub struct DownloadOrchestrator {
     index: SnapshotIndex,
     peer_mgr: PeerManager,
     metrics: Metrics,
+    fallback: Option<FallbackManager>,
 }
 
 impl DownloadOrchestrator {
@@ -150,56 +228,48 @@ impl DownloadOrchestrator {
             index,
             peer_mgr,
             metrics,
+            fallback: None,
         }
+    }
+
+    /// Attach an external-source fallback tier.
+    pub fn with_fallback(mut self, fallback: Option<FallbackManager>) -> Self {
+        self.fallback = fallback;
+        self
     }
 
     /// Check if we need a new snapshot and download it if so.
     pub async fn fetch_if_needed(&self) -> Result<FetchOutcome> {
         let local_snaps = self.index.list().await;
         let ranked = self.peer_mgr.ranked_peers().await;
-        if ranked.is_empty() {
-            info!("no peers available, skipping fetch");
-            return Ok(FetchOutcome::NoPeers);
+
+        // No peers / only slow peers: try the external tier first, keeping
+        // whatever peers exist as last resort below.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let pre_trigger = self.fallback.as_ref().and_then(|fb| {
+            policy::pre_fetch_fallback_trigger(&ranked, fb.config().min_peer_bandwidth, now_unix)
+        });
+        let mut fallback_outcome = None;
+        if let Some(trigger) = pre_trigger {
+            let outcome = self.try_fallback(trigger, &local_snaps).await?;
+            if outcome == FetchOutcome::Downloaded {
+                return Ok(outcome);
+            }
+            fallback_outcome = Some(outcome);
         }
 
-        let decision = policy::decide(&local_snaps, &ranked, self.config.min_slots_behind);
+        if ranked.is_empty() {
+            info!("no peers available, skipping fetch");
+            return Ok(fallback_outcome.unwrap_or(FetchOutcome::NoPeers));
+        }
 
+        let sources: Vec<SourceView> = ranked.iter().map(SourceView::from_peer).collect();
+        let decision = policy::decide(&local_snaps, &sources, self.config.min_slots_behind);
         let Some(reason) = decision.reason else {
-            if decision.local_bootstrap == 0 {
-                warn!(
-                    best_remote_slot = decision.best_remote_slot,
-                    "no local snapshot and no peer offers one"
-                );
-                return Ok(FetchOutcome::Unresolved(FetchReason::Bootstrap));
-            }
-            return Ok(match decision.gate {
-                FullFetchGate::UpToDate => {
-                    info!(
-                        local_bootstrap = decision.local_bootstrap,
-                        best_remote_slot = decision.best_remote_slot,
-                        "local bootstrap is up to date with peers"
-                    );
-                    FetchOutcome::NotNeeded
-                }
-                FullFetchGate::NotFarEnoughBehind { diff } => {
-                    info!(
-                        local_bootstrap = decision.local_bootstrap,
-                        best_remote_slot = decision.best_remote_slot,
-                        diff,
-                        min = self.config.min_slots_behind,
-                        "not far enough behind for new full snapshot"
-                    );
-                    FetchOutcome::NotNeeded
-                }
-                FullFetchGate::Seek { diff } => {
-                    warn!(
-                        local_bootstrap = decision.local_bootstrap,
-                        best_remote_slot = decision.best_remote_slot,
-                        "behind, but no worthwhile plan from peers; waiting"
-                    );
-                    FetchOutcome::Unresolved(FetchReason::Behind { diff })
-                }
-            });
+            return Ok(self.no_plan_outcome(&decision));
         };
 
         info!(
@@ -210,26 +280,128 @@ impl DownloadOrchestrator {
             "fetch cycle planned"
         );
 
-        let mut slow_peers: HashSet<&str> = HashSet::new();
+        // While the external tier hasn't run this cycle, it is a remaining
+        // candidate: the speed floor stays in force for the last peer.
+        let backup = if pre_trigger.is_none() {
+            self.fallback.as_ref()
+        } else {
+            None
+        };
+        match self.run_plans(&decision, reason, backup).await? {
+            PlansResult::Downloaded(_) => return Ok(FetchOutcome::Downloaded),
+            PlansResult::Failed { any_err } => {
+                if any_err
+                    && backup.is_some()
+                    && self
+                        .try_fallback(FallbackTrigger::PeerPlansFailed, &local_snaps)
+                        .await?
+                        == FetchOutcome::Downloaded
+                {
+                    return Ok(FetchOutcome::Downloaded);
+                }
+            }
+        }
+
+        warn!(
+            reason = reason.as_str(),
+            local_bootstrap = decision.local_bootstrap,
+            best_remote_slot = decision.best_remote_slot,
+            "no download plan succeeded this cycle"
+        );
+        Ok(FetchOutcome::Unresolved(reason))
+    }
+
+    /// Outcome of a cycle whose decision produced no plan.
+    fn no_plan_outcome(&self, decision: &FetchDecision) -> FetchOutcome {
+        if decision.local_bootstrap == 0 {
+            warn!(
+                best_remote_slot = decision.best_remote_slot,
+                "no local snapshot and no source offers one"
+            );
+            return FetchOutcome::Unresolved(FetchReason::Bootstrap);
+        }
+        match decision.gate {
+            FullFetchGate::UpToDate => {
+                info!(
+                    local_bootstrap = decision.local_bootstrap,
+                    best_remote_slot = decision.best_remote_slot,
+                    "local bootstrap is up to date with sources"
+                );
+                FetchOutcome::NotNeeded
+            }
+            FullFetchGate::NotFarEnoughBehind { diff } => {
+                info!(
+                    local_bootstrap = decision.local_bootstrap,
+                    best_remote_slot = decision.best_remote_slot,
+                    diff,
+                    min = self.config.min_slots_behind,
+                    "not far enough behind for new full snapshot"
+                );
+                FetchOutcome::NotNeeded
+            }
+            FullFetchGate::Seek { diff } => {
+                warn!(
+                    local_bootstrap = decision.local_bootstrap,
+                    best_remote_slot = decision.best_remote_slot,
+                    "behind, but no worthwhile plan from sources; waiting"
+                );
+                FetchOutcome::Unresolved(FetchReason::Behind { diff })
+            }
+        }
+    }
+
+    /// Attempt `decision.plans` in order, applying the per-cycle speed-floor
+    /// rule. `backup` is a tier still to run after these plans: when it has
+    /// usable sources, the floor stays in force for the last plan here.
+    async fn run_plans(
+        &self,
+        decision: &FetchDecision,
+        reason: FetchReason,
+        backup: Option<&FallbackManager>,
+    ) -> Result<PlansResult> {
+        let mut slow_sources: HashSet<&str> = HashSet::new();
+        let mut backup_usable: Option<bool> = None;
+        let mut any_err = false;
         for (i, plan) in decision.plans.iter().enumerate() {
-            let min_speed = match policy::plan_attempt(
+            let mut attempt = policy::plan_attempt(
                 &decision.plans,
                 i,
-                &slow_peers,
+                &slow_sources,
                 self.config.min_speed,
-            ) {
+                false,
+            );
+            // Dropping the floor (or keeping a slow source) only makes sense
+            // when nothing else is left; probe the backup tier lazily, at the
+            // first moment that question comes up.
+            let floor_dropped =
+                self.config.min_speed > 0 && attempt == PlanAttempt::Run { min_speed: 0 };
+            if floor_dropped && let Some(fb) = backup {
+                if backup_usable.is_none() {
+                    backup_usable = Some(!fb.discover_sources().await.is_empty());
+                }
+                if backup_usable == Some(true) {
+                    attempt = policy::plan_attempt(
+                        &decision.plans,
+                        i,
+                        &slow_sources,
+                        self.config.min_speed,
+                        true,
+                    );
+                }
+            }
+            let min_speed = match attempt {
                 PlanAttempt::Skip => {
                     info!(
-                        peer = plan.peer_addr,
-                        "skipping plan: peer was below min_speed this cycle"
+                        source = plan.source.label(),
+                        "skipping plan: source was below min_speed this cycle"
                     );
                     continue;
                 }
                 PlanAttempt::Run { min_speed } => {
                     if min_speed < self.config.min_speed {
                         info!(
-                            peer = plan.peer_addr,
-                            "last candidate peer: min_speed not enforced"
+                            source = plan.source.label(),
+                            "last candidate source: min_speed not enforced"
                         );
                     }
                     min_speed
@@ -237,14 +409,14 @@ impl DownloadOrchestrator {
             };
             if plan.incremental_only {
                 info!(
-                    peer = plan.peer_addr,
+                    source = plan.source.label(),
                     base_full = plan.full.slot,
                     incremental = plan.incremental.as_ref().map(|s| s.slot),
                     "attempting incremental on local full"
                 );
             } else {
                 info!(
-                    peer = plan.peer_addr,
+                    source = plan.source.label(),
                     full = plan.full.file_name,
                     incremental = plan.incremental.as_ref().map(|s| &s.file_name),
                     "attempting newer full snapshot plan"
@@ -260,24 +432,60 @@ impl DownloadOrchestrator {
                 )
                 .await
             {
-                Ok(true) => return Ok(FetchOutcome::Downloaded),
+                Ok(true) => return Ok(PlansResult::Downloaded(plan.source.clone())),
                 Ok(false) => continue,
                 Err(e) => {
+                    any_err = true;
                     if e.downcast_ref::<SlowTransfer>().is_some() {
-                        slow_peers.insert(plan.peer_addr.as_str());
+                        slow_sources.insert(plan.source.label());
                     }
-                    warn!(peer = plan.peer_addr, error = %e, "download failed, trying next plan");
+                    warn!(source = plan.source.label(), error = %e, "download failed, trying next plan");
                 }
             }
         }
+        Ok(PlansResult::Failed { any_err })
+    }
 
-        warn!(
-            reason = reason.as_str(),
-            local_bootstrap = decision.local_bootstrap,
-            best_remote_slot = decision.best_remote_slot,
-            "no download plan succeeded this cycle"
+    /// Discover external sources and run the regular fetch policy over them.
+    async fn try_fallback(
+        &self,
+        trigger: FallbackTrigger,
+        local_snaps: &[SnapshotInfo],
+    ) -> Result<FetchOutcome> {
+        let Some(fallback) = &self.fallback else {
+            return Ok(FetchOutcome::NoPeers);
+        };
+
+        info!(
+            trigger = trigger.as_str(),
+            "peer sources insufficient, trying external snapshot sources"
         );
-        Ok(FetchOutcome::Unresolved(reason))
+        self.metrics
+            .fallback_attempts
+            .get_or_create(&crate::metrics::TriggerLabel::new(trigger.as_str()))
+            .inc();
+
+        let sources = fallback.discover_sources().await;
+        if sources.is_empty() {
+            info!("no usable external snapshot sources");
+            return Ok(FetchOutcome::NoPeers);
+        }
+
+        let decision = policy::decide(local_snaps, &sources, self.config.min_slots_behind);
+        let Some(reason) = decision.reason else {
+            return Ok(self.no_plan_outcome(&decision));
+        };
+
+        match self.run_plans(&decision, reason, None).await? {
+            PlansResult::Downloaded(source) => {
+                self.metrics
+                    .fallback_downloads
+                    .get_or_create(&crate::metrics::SourceLabel::new(source.label()))
+                    .inc();
+                Ok(FetchOutcome::Downloaded)
+            }
+            PlansResult::Failed { .. } => Ok(FetchOutcome::Unresolved(reason)),
+        }
     }
 
     async fn plan_needs_download(&self, plan: &DownloadPlan) -> bool {
@@ -317,7 +525,9 @@ impl DownloadOrchestrator {
             Ok(bytes) if bytes > 0 => {
                 let duration = start.elapsed();
                 let bps = bytes as f64 / duration.as_secs_f64();
-                self.peer_mgr.record_bandwidth(&plan.peer_addr, bps).await;
+                if let Some(peer) = plan.source.peer_addr() {
+                    self.peer_mgr.record_bandwidth(peer, bps).await;
+                }
                 self.metrics
                     .download_duration
                     .observe(duration.as_secs_f64());
@@ -327,7 +537,7 @@ impl DownloadOrchestrator {
                     .get_or_create(&crate::metrics::ReasonLabel::new(reason.as_str()))
                     .inc();
                 info!(
-                    peer = plan.peer_addr,
+                    source = plan.source.label(),
                     bytes,
                     duration_secs = duration.as_secs_f64(),
                     mbps = bps / 1_000_000.0,
@@ -342,7 +552,18 @@ impl DownloadOrchestrator {
                 Ok(true)
             }
             Ok(_) => Ok(false),
-            Err(e) => Err(e),
+            Err(e) => {
+                // A watchdog abort measured this peer as slow: remember that,
+                // so the next cycle's slow-peer trigger can see it.
+                if let Some(peer) = plan.source.peer_addr()
+                    && let Some(slow) = e.downcast_ref::<SlowTransfer>()
+                {
+                    self.peer_mgr
+                        .record_bandwidth(peer, slow.measured_bps)
+                        .await;
+                }
+                Err(e)
+            }
         }
     }
 
@@ -386,18 +607,21 @@ impl DownloadOrchestrator {
         let need_full = !plan.incremental_only && !full_local;
         let need_inc = plan.incremental.is_some() && !inc_local;
 
+        let fallback = self.fallback.as_ref();
         let (full_dl, inc_dl) = match (need_full, need_inc) {
             (true, true) => {
                 let full_fut = download_one_file(
                     &self.config,
-                    &plan.peer_addr,
+                    fallback,
+                    &plan.source,
                     &plan.full,
                     &tmp_dir,
                     min_speed,
                 );
                 let inc_fut = download_one_file(
                     &self.config,
-                    &plan.peer_addr,
+                    fallback,
+                    &plan.source,
                     plan.incremental.as_ref().unwrap(),
                     &tmp_dir,
                     min_speed,
@@ -416,7 +640,8 @@ impl DownloadOrchestrator {
             (true, false) => {
                 let full_dl = download_one_file(
                     &self.config,
-                    &plan.peer_addr,
+                    fallback,
+                    &plan.source,
                     &plan.full,
                     &tmp_dir,
                     min_speed,
@@ -427,7 +652,8 @@ impl DownloadOrchestrator {
             (false, true) => {
                 let inc_dl = match download_one_file(
                     &self.config,
-                    &plan.peer_addr,
+                    fallback,
+                    &plan.source,
                     plan.incremental.as_ref().unwrap(),
                     &tmp_dir,
                     min_speed,
@@ -453,7 +679,7 @@ impl DownloadOrchestrator {
                     plan.full.slot,
                     local_bootstrap,
                     &tmp_dir,
-                    &plan.peer_addr,
+                    plan.source.peer_addr(),
                     min_speed,
                 )
                 .await
@@ -472,7 +698,12 @@ impl DownloadOrchestrator {
             ) {
                 // Keep the verified full in staging: next cycle reuses it via
                 // the checksum match in download_one_file instead of pulling
-                // the same 100 GB again.
+                // the same 100 GB again. Record the computed hash as a staging
+                // sidecar so the reuse also works for external sources, which
+                // report no hash of their own.
+                if let Some(ref dl) = full_dl {
+                    crate::snapshot::save_sidecar_hash(&tmp_dir.join(&dl.file_name), &dl.sha256);
+                }
                 anyhow::bail!(
                     "full snapshot at slot {} is {} slots behind tip {}, \
                      exceeds min_slots_behind={}, need incremental",
@@ -494,6 +725,8 @@ impl DownloadOrchestrator {
         if let Some(ref dl) = full_dl {
             total_bytes += dl.bytes;
             self.index.admit(&dl.file_name, &dl.sha256).await?;
+            let sidecar = snapshot::sidecar_path(&tmp_dir.join(&dl.file_name));
+            tokio::fs::remove_file(sidecar).await.ok();
         }
         if let Some(ref dl) = inc_dl {
             total_bytes += dl.bytes;
@@ -512,20 +745,21 @@ impl DownloadOrchestrator {
     /// Re-poll peers live to find and download an incremental snapshot
     /// compatible with `full_slot` and strictly above `min_slot` (pass the
     /// local bootstrap so we never fetch one we already surpass). Tries the
-    /// original peer first, then others.
+    /// original peer first, then others. External sources can't be re-polled,
+    /// so for an external plan (`original_peer` = None) only cm peers are tried.
     async fn try_fetch_incremental(
         &self,
         full_slot: u64,
         min_slot: u64,
         tmp_dir: &Path,
-        original_peer: &str,
+        original_peer: Option<&str>,
         min_speed: u64,
     ) -> Option<DownloadedFile> {
         let all_peers = self.peer_mgr.list_peers().await;
-        let mut addrs: Vec<String> = Vec::with_capacity(all_peers.len());
-        addrs.push(original_peer.to_string());
+        let mut addrs: Vec<String> = Vec::with_capacity(all_peers.len() + 1);
+        addrs.extend(original_peer.map(String::from));
         for p in &all_peers {
-            if p.addr != original_peer {
+            if Some(p.addr.as_str()) != original_peer {
                 addrs.push(p.addr.clone());
             }
         }
@@ -550,7 +784,16 @@ impl DownloadOrchestrator {
                 "retrying incremental download"
             );
 
-            match download_one_file(&self.config, addr, &inc, tmp_dir, min_speed).await {
+            match download_one_file(
+                &self.config,
+                None,
+                &SnapshotSource::peer(addr.clone()),
+                &inc,
+                tmp_dir,
+                min_speed,
+            )
+            .await
+            {
                 Ok(dl) => return Some(dl),
                 Err(e) => {
                     warn!(peer = %addr, error = %e, "incremental retry failed");

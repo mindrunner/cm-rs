@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -14,6 +14,48 @@ use super::{DownloadResult, SlowTransfer};
 const MIN_SPEED_WINDOW: Duration = Duration::from_secs(60);
 const ABORT_POLL: Duration = Duration::from_secs(1);
 
+/// Shared abort signal: 0 = keep going; any other value = abort, encoding the
+/// measured speed in bytes/sec (clamped to at least 1 so it reads as set).
+type AbortSignal = Arc<AtomicU64>;
+
+fn abort_error(bps: u64) -> anyhow::Error {
+    SlowTransfer {
+        measured_bps: bps as f64,
+    }
+    .into()
+}
+
+/// Aborts the given tasks when dropped. Every early return from a download
+/// (a failed chunk, a slow abort) must stop its chunk tasks and watchdog:
+/// left running, they keep writing `.cm-chunk-*` files that the next plan
+/// for the same snapshot reuses by name, splicing two sources into one file.
+struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
+}
+
+/// Next body chunk, or `SlowTransfer` once the watchdog sets `abort`. Polls
+/// the flag while waiting so a stalled connection is abandoned too.
+async fn next_chunk<S, T>(stream: &mut S, abort: &AtomicU64) -> Result<Option<T>>
+where
+    S: futures_util::Stream<Item = reqwest::Result<T>> + Unpin,
+{
+    loop {
+        let bps = abort.load(Ordering::Relaxed);
+        if bps != 0 {
+            return Err(abort_error(bps));
+        }
+        if let Ok(next) = tokio::time::timeout(ABORT_POLL, stream.next()).await {
+            return Ok(next.transpose()?);
+        }
+    }
+}
+
 /// Download a file using parallel HTTP range requests.
 ///
 /// Returns bytes written and SHA-256 digest.
@@ -25,26 +67,7 @@ pub async fn download(
 ) -> Result<DownloadResult> {
     let client = reqwest::Client::new();
 
-    let head = client
-        .head(url)
-        .send()
-        .await
-        .context("HEAD request failed")?
-        .error_for_status()
-        .context("HEAD returned error status")?;
-
-    let total_size = head
-        .headers()
-        .get(reqwest::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-
-    let accepts_ranges = head
-        .headers()
-        .get(reqwest::header::ACCEPT_RANGES)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.contains("bytes"))
-        .unwrap_or(false);
+    let (total_size, accepts_ranges) = probe_size(&client, url).await;
 
     match (total_size, accepts_ranges) {
         (Some(size), true) if size > 0 && parallel_chunks > 1 => {
@@ -54,6 +77,49 @@ pub async fn download(
         _ => {
             info!("falling back to sequential download");
             sequential_download(&client, url, dest, total_size, min_speed).await
+        }
+    }
+}
+
+/// Learn the file size and range support, preferring HEAD. Some sources
+/// (presigned object-store URLs) only accept GET — for those a one-byte range
+/// request reveals both via the 206 `Content-Range` total.
+async fn probe_size(client: &reqwest::Client, url: &str) -> (Option<u64>, bool) {
+    match client.head(url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let total_size = resp
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            let accepts_ranges = resp
+                .headers()
+                .get(reqwest::header::ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.contains("bytes"))
+                .unwrap_or(false);
+            (total_size, accepts_ranges)
+        }
+        _ => {
+            debug!(url, "HEAD not supported, probing size with a range GET");
+            match client
+                .get(url)
+                .header(reqwest::header::RANGE, "bytes=0-0")
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+                    // "bytes 0-0/12345" — the total after the slash.
+                    let total = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.rsplit('/').next())
+                        .and_then(|v| v.parse::<u64>().ok());
+                    (total, total.is_some())
+                }
+                _ => (None, false),
+            }
         }
     }
 }
@@ -87,7 +153,7 @@ fn spawn_progress_watchdog(
     total_size: u64,
     file_name: String,
     min_speed: u64,
-    abort: Arc<AtomicBool>,
+    abort: AbortSignal,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let start = Instant::now();
@@ -150,14 +216,16 @@ fn spawn_progress_watchdog(
                         slow_for_secs = slow_dur.as_secs(),
                         "aborting download: speed below minimum for too long"
                     );
-                    abort.store(true, Ordering::Relaxed);
+                    abort.store((instant_speed as u64).max(1), Ordering::Relaxed);
                     break;
                 }
             } else {
                 slow_since = None;
             }
 
-            if bytes >= total_size {
+            // total_size == 0 means unknown size: keep watching until the
+            // download task aborts this watchdog.
+            if total_size > 0 && bytes >= total_size {
                 break;
             }
         }
@@ -176,7 +244,7 @@ async fn parallel_range_download(
     let tmp_dir = dest.parent().unwrap_or(Path::new("."));
 
     let downloaded = Arc::new(AtomicU64::new(0));
-    let abort = Arc::new(AtomicBool::new(false));
+    let abort: AbortSignal = Arc::new(AtomicU64::new(0));
     let file_name = dest
         .file_name()
         .unwrap_or_default()
@@ -191,6 +259,7 @@ async fn parallel_range_download(
         Arc::clone(&abort),
     );
 
+    let mut guard = AbortOnDrop(vec![progress_handle.abort_handle()]);
     let mut handles = Vec::new();
 
     for i in 0..chunks {
@@ -211,6 +280,7 @@ async fn parallel_range_download(
             download_range_streaming(&client, &url, &chunk_path, start, end, downloaded, abort)
                 .await
         });
+        guard.0.push(handle.abort_handle());
         handles.push((handle, i));
     }
 
@@ -239,22 +309,6 @@ async fn parallel_range_download(
     })
 }
 
-/// Next body chunk, or `SlowTransfer` once the watchdog sets `abort`. Polls
-/// the flag while waiting so a stalled connection is abandoned too.
-async fn next_chunk<S, T>(stream: &mut S, abort: &AtomicBool) -> Result<Option<T>>
-where
-    S: futures_util::Stream<Item = reqwest::Result<T>> + Unpin,
-{
-    loop {
-        if abort.load(Ordering::Relaxed) {
-            return Err(SlowTransfer.into());
-        }
-        if let Ok(next) = tokio::time::timeout(ABORT_POLL, stream.next()).await {
-            return Ok(next.transpose()?);
-        }
-    }
-}
-
 async fn download_range_streaming(
     client: &reqwest::Client,
     url: &str,
@@ -262,7 +316,7 @@ async fn download_range_streaming(
     start: u64,
     end: u64,
     downloaded: Arc<AtomicU64>,
-    abort: Arc<AtomicBool>,
+    abort: AbortSignal,
 ) -> Result<u64> {
     let range = format!("bytes={}-{}", start, end);
     let resp = client
@@ -309,22 +363,23 @@ async fn sequential_download(
     }
 
     let downloaded = Arc::new(AtomicU64::new(0));
-    let abort = Arc::new(AtomicBool::new(false));
+    let abort: AbortSignal = Arc::new(AtomicU64::new(0));
     let file_name = dest
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
 
-    let progress_handle = total_size.map(|size| {
-        spawn_progress_watchdog(
-            Arc::clone(&downloaded),
-            size,
-            file_name,
-            min_speed,
-            Arc::clone(&abort),
-        )
-    });
+    // Spawn the watchdog even when the size is unknown (0): min-speed abort
+    // protection must not depend on the server answering HEAD/range probes.
+    let progress_handle = spawn_progress_watchdog(
+        Arc::clone(&downloaded),
+        total_size.unwrap_or(0),
+        file_name,
+        min_speed,
+        Arc::clone(&abort),
+    );
+    let _guard = AbortOnDrop(vec![progress_handle.abort_handle()]);
 
     let mut file = tokio::fs::File::create(dest).await?;
     let mut stream = resp.bytes_stream();
@@ -340,9 +395,7 @@ async fn sequential_download(
     }
 
     file.flush().await?;
-    if let Some(h) = progress_handle {
-        h.abort();
-    }
+    progress_handle.abort();
     let hash = crate::snapshot::hex_encode_sha256(&hasher.finalize());
     Ok(DownloadResult {
         bytes: total,
@@ -357,16 +410,88 @@ mod tests {
     #[tokio::test]
     async fn next_chunk_abandons_a_stalled_stream_on_abort() {
         let mut stream = futures_util::stream::pending::<reqwest::Result<Vec<u8>>>();
-        let abort = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicU64::new(0));
         let flag = Arc::clone(&abort);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            flag.store(true, Ordering::Relaxed);
+            flag.store(1, Ordering::Relaxed);
         });
 
         let res = tokio::time::timeout(Duration::from_secs(5), next_chunk(&mut stream, &abort))
             .await
             .expect("stalled stream was never abandoned");
         assert!(res.unwrap_err().downcast_ref::<SlowTransfer>().is_some());
+    }
+
+    /// Serves a 4 MiB file: the range starting at 0 fails, every other range
+    /// trickles forever.
+    async fn start_failing_range_server() -> String {
+        use axum::http::{HeaderMap, StatusCode, header};
+        use axum::response::IntoResponse;
+
+        const SIZE: u64 = 4 * 1024 * 1024;
+        async fn handler(
+            method: axum::http::Method,
+            headers: HeaderMap,
+        ) -> axum::response::Response {
+            let base = [
+                (header::CONTENT_LENGTH, SIZE.to_string()),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+            ];
+            if method == axum::http::Method::HEAD {
+                return (StatusCode::OK, base).into_response();
+            }
+            let range = headers
+                .get(header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if range.starts_with("bytes=0-") {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            let body = futures_util::stream::unfold((), |()| async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Some((Ok::<_, std::io::Error>(vec![7u8; 1024]), ()))
+            });
+            (
+                StatusCode::PARTIAL_CONTENT,
+                axum::body::Body::from_stream(body),
+            )
+                .into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/f", axum::routing::get(handler));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{}/f", addr)
+    }
+
+    fn chunk_bytes(dir: &Path) -> u64 {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".cm-chunk-"))
+            .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn failed_chunk_stops_the_other_chunk_tasks() {
+        let url = start_failing_range_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("snapshot-1-h.tar.zst");
+
+        let res = download(&url, &dest, 4, 0).await;
+        assert!(res.is_err(), "failed chunk must fail the download");
+
+        // Let the runtime finish cancelling, then the leftovers must be idle.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let before = chunk_bytes(dir.path());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            chunk_bytes(dir.path()),
+            before,
+            "chunk tasks kept writing after the download returned"
+        );
     }
 }

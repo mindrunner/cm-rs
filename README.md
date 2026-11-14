@@ -6,7 +6,12 @@
 A decentralized Solana snapshot cluster manager. `cm` indexes local `.tar.zst`
 snapshot files, exposes them over HTTP, discovers and polls peers (static list
 and/or Tailscale), downloads newer snapshots from peers with parallel chunked
-transfers, optionally uploads to S3, and exports Prometheus metrics.
+transfers, optionally uploads to S3, and exports Prometheus metrics. When no
+(or only slow) peers can serve, it can optionally fall back to external
+snapshot sources — public mirrors like
+[avorio](https://avorio.network/snapshots/) and gossip-advertised RPC nodes —
+speed-testing candidates and downloading from the fastest, similar to
+[solana-snapshot-finder](https://github.com/1dad-io/solana-snapshot-finder).
 
 ## Architecture
 
@@ -170,6 +175,31 @@ for a fully commented example.
 | `enabled`        | bool     | `true`  | Enable periodic auto-fetch        |
 | `check_interval` | duration | `30s`   | How often to check for new snapshots |
 
+### `[fallback]`
+
+External snapshot sources used when no cm peers are known, every measured peer
+is slow, or all peer downloads failed in a cycle. Sources must follow the
+agave RPC snapshot convention (`{base}/snapshot.tar.bz2` redirecting to the
+concrete file). Candidates are probed for latency, filtered by slot lag,
+speed-tested, and tried fastest-first through the same fetch policy as peers.
+External archives carry no source-reported checksum (a local SHA-256 sidecar
+is computed on admit), which is why this tier is opt-in.
+
+| Key                  | Type     | Default                                          | Description                                        |
+|----------------------|----------|--------------------------------------------------|----------------------------------------------------|
+| `enabled`            | bool     | `false`                                          | Enable the external fallback tier                  |
+| `mirrors`            | string[] | `["https://snapshots.avorio.network/mainnet-beta"]` | Static mirror base URLs                        |
+| `rpc_urls`           | string[] | `["https://api.mainnet-beta.solana.com"]`        | RPC endpoints for `getClusterNodes` node discovery and `getSlot` tip |
+| `min_peer_bandwidth` | u64      | `10000000`                                       | Peers measured below this (bytes/sec) count as slow; if **all** measured peers are slow, external is tried first (0 = off) |
+| `max_slot_lag`       | u64      | `1300`                                           | Reject external snapshots this far behind the tip  |
+| `max_candidates`     | usize    | `5`                                              | Speed-test only the N lowest-latency candidates    |
+| `probe_concurrency`  | usize    | `16`                                             | Concurrent probes                                  |
+| `speed_test_bytes`   | u64      | `16777216`                                       | Bytes downloaded per candidate to measure speed    |
+| `min_source_speed`   | u64      | `0`                                              | Drop candidates below this (bytes/sec); 0 = accept any |
+| `probe_timeout`      | duration | `5s`                                             | Per-probe request timeout                          |
+| `speed_test_timeout` | duration | `15s`                                            | Per-candidate speed-test budget                    |
+| `cooldown`           | duration | `10m`                                            | Probe results are cached and reused this long      |
+
 Duration values accept human-readable strings: `30s`, `5m`, `1h`, etc.
 
 ## Deployment
@@ -240,6 +270,8 @@ label is added to every metric.
 | `cm_peers_total`                  | gauge     | Number of known peers          |
 | `cm_download_duration_seconds`    | histogram | Snapshot download duration     |
 | `cm_download_bytes_total`         | counter   | Total bytes downloaded         |
+| `cm_fallback_attempts_total`      | counter   | External-source fallback attempts by trigger |
+| `cm_fallback_downloads_total`     | counter   | Completed downloads from external sources |
 | `cm_s3_upload_duration_seconds`   | histogram | S3 upload duration             |
 
 ## Acknowledgments
